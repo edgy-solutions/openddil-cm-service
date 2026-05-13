@@ -1,0 +1,47 @@
+# OpenDDIL CM Service — LLM Context
+
+This repository (`openddil-cm-service`) houses the Configuration Management
+Restate Virtual Object for OpenDDIL Phase 3.
+
+## Purpose
+
+One durable `AssetCM` Virtual Object instance per `asset_id`. Owns:
+- As-Maintained configuration state (installed CIs, mod compliance,
+  discrepancies, lifecycle)
+- Discrepancy analyzer output (pure-Python; framework-free)
+- Transition alert emission to `tactical-events` (CloudEvents JSON)
+- State publication to compacted `asset-cm-state` Kafka topic
+
+## Key Files
+
+- `src/events/asset_cm.py` — Restate Virtual Object. 4 handlers:
+  `observe`, `apply_cm_event`, `recheck_compliance`, `decommission`.
+- `src/discrepancy/analyzer.py` — pure-Python `compute_discrepancies`
+  + `overall_status` + `initialize_from_baseline`. 97% test coverage.
+  No Faust/Kafka/Restate imports.
+- `src/as_maintained/persistence_model.py` — `AsMaintainedRecord`
+  dataclass with separate `discrepancies` (analyzer-rebuilt) and
+  `manual_discrepancies` (human-raised, preserved across reanalysis).
+- `src/as_maintained/store.py` — dict<->proto bridge; merges both
+  discrepancy lists into wire-form `ConfigurationDiscrepancy[]`.
+- `src/baselines/loader.py` — YAML baseline registry, SIGHUP hot-reload.
+- `src/main.py` — hypercorn ASGI server.
+- `bootstrap/register_subscriptions.py` — thin wrapper around the
+  shared `openddil_bootstrap.restate_subscriptions` library.
+
+## Rules
+
+- Persistence/Computation separation (ADR-0006): analyzer is pure
+  Python; Kafka/Restate plumbing lives in `events/` and `main.py`.
+- Manual discrepancies live in a SEPARATE list and survive analyzer
+  reanalysis (see ADR-0009 addendum).
+- Restate state is durable across Kafka topic purges. Clear with
+  `restate state clear "AssetCM/<asset_id>" --force --yes`.
+
+## Docker Compose
+
+When consumed by openddil-demo:
+- Base `docker-compose.yml` references `image: ghcr.io/edgy-solutions/openddil/cm-service:latest`.
+- `docker-compose.override.yml` has the `build:` block + source mounts
+  for development.
+- NEVER add a `build:` to the base compose. Publish a new image first.

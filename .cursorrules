@@ -1,0 +1,8 @@
+# Cursor Rules for OpenDDIL CM Service
+
+- **Context**: Configuration Management Restate Virtual Object (`AssetCM`). One durable instance per `asset_id`.
+- **Boundary discipline** (ADR-0006): `src/discrepancy/analyzer.py` is pure Python, no Faust/Kafka/Restate imports. Plumbing lives in `src/events/asset_cm.py` and `src/main.py`.
+- **Manual discrepancies**: separate list on `AsMaintainedRecord`; survive reanalysis. Do NOT merge `manual_discrepancies` into `discrepancies` (see ADR-0009 addendum).
+- **Shared bootstrap**: `bootstrap/register_subscriptions.py` is a thin wrapper around `openddil_bootstrap.restate_subscriptions`. Do not reimplement deployment/subscription registration here.
+- **Restate state durability**: Survives Kafka topic purges. Clear with `restate state clear "AssetCM/<asset_id>" --force --yes` when tests need fresh state.
+- **Docker Compose**: Base `openddil-demo/docker-compose.yml` references `image: ghcr.io/edgy-solutions/openddil/cm-service:latest`. NEVER add `build:` to the base compose. Builds live in `docker-compose.override.yml` only. Publish a new image when the Dockerfile changes.
