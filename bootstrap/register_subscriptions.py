@@ -1,17 +1,13 @@
 """
 cm-service bootstrap — thin wrapper around the shared library.
 
-This file used to carry the full Restate registration plumbing
-(deployment register, Kafka cluster register, subscription dedup-and-create).
-That logic moved to `openddil_bootstrap.restate_subscriptions` so other
-Restate services (logistics-fusion-service, future identity-resolver, etc.)
-reuse it instead of copy-pasting it.
+Owns cm-service's subscription list. Restate-side plumbing lives in
+`openddil_bootstrap.restate_subscriptions`.
 
-This wrapper:
-  - Owns cm-service's subscription list (what topics this service consumes).
-  - Resolves config from env so deployment can change brokers/endpoints
-    without code changes.
-  - Calls `bootstrap_restate_service` and exits.
+ADR-0023 Phase 6b §A: cm-service subscribes to each of the 3 per-edge
+Kafka clusters. Deployment registration is idempotent (409s handled);
+each cluster gets its own subscriptions with edge-suffixed consumer-group
+names so per-edge consumer-group lag is readable in rpk.
 """
 from __future__ import annotations
 
@@ -19,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 from openddil_bootstrap.restate_subscriptions import (
     Subscription,
@@ -28,22 +25,34 @@ from openddil_bootstrap.restate_subscriptions import (
 logger = logging.getLogger("cm_service.bootstrap")
 
 
-# ---------------------------------------------------------------------------
-# Configuration via env (no hardcoded topic names per ADR-0010)
-# ---------------------------------------------------------------------------
 RESTATE_ADMIN_URL   = os.getenv("RESTATE_ADMIN_URL",   "http://restate-server:9070")
 CM_SERVICE_ENDPOINT = os.getenv("CM_SERVICE_ENDPOINT", "http://cm-service:9080")
-KAFKA_CLUSTER_NAME  = os.getenv("KAFKA_CLUSTER_NAME",  "openddil-edge")
-KAFKA_BROKERS       = os.getenv("KAFKA_BROKERS",       "redpanda-edge:9092")
 BOOTSTRAP_TIMEOUT_S = int(os.getenv("CM_BOOTSTRAP_TIMEOUT_S", "120"))
 
+DEFAULT_EDGE_CLUSTERS = (
+    "edge-01=redpanda-edge-01:9092,"
+    "edge-02=redpanda-edge-02:9092,"
+    "edge-03=redpanda-edge-03:9092"
+)
+EDGE_CLUSTERS = os.getenv("CM_EDGE_CLUSTERS", DEFAULT_EDGE_CLUSTERS)
 
-def _subscriptions() -> list[Subscription]:
-    """cm-service's subscription list.
 
-    Override via CM_SUBSCRIPTIONS (JSON list of {topic, handler, consumer_group})
-    to add feeds without code changes.
-    """
+def _parse_clusters(spec: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise RuntimeError(
+                f"CM_EDGE_CLUSTERS entry {entry!r} must be 'edge_id=host:port'"
+            )
+        edge_id, brokers = entry.split("=", 1)
+        out.append((edge_id.strip(), brokers.strip()))
+    return out
+
+
+def _per_edge_subscriptions(edge_id: str) -> list[Subscription]:
     override = os.getenv("CM_SUBSCRIPTIONS")
     if override:
         try:
@@ -56,14 +65,14 @@ def _subscriptions() -> list[Subscription]:
 
     return [
         Subscription(
-            topic=os.getenv("CM_TOPIC_SILVER", "raw-sensor-stream"),
+            topic="raw-sensor-stream",
             handler="AssetCM/observe",
-            consumer_group=os.getenv("CM_GROUP_SILVER", "cm-service-silver"),
+            consumer_group=f"cm-service-silver-{edge_id}",
         ),
         Subscription(
-            topic=os.getenv("CM_TOPIC_CM_EVENTS", "cm-events"),
+            topic="cm-events",
             handler="AssetCM/apply_cm_event",
-            consumer_group=os.getenv("CM_GROUP_CM_EVENTS", "cm-service-cm-events"),
+            consumer_group=f"cm-service-cm-events-{edge_id}",
         ),
     ]
 
@@ -74,15 +83,35 @@ def main() -> int:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
-    return bootstrap_restate_service(
-        service_label="cm-service",
-        restate_admin_url=RESTATE_ADMIN_URL,
-        service_endpoint=CM_SERVICE_ENDPOINT,
-        kafka_cluster_name=KAFKA_CLUSTER_NAME,
-        kafka_brokers=KAFKA_BROKERS,
-        subscriptions=_subscriptions(),
-        timeout_s=BOOTSTRAP_TIMEOUT_S,
-    )
+
+    edge_clusters = _parse_clusters(EDGE_CLUSTERS)
+    # ADR-0023 Phase 6b §A — Restate 1.6.2 subscription_controller race:
+    # concurrent multi-cluster subscription registration triggered a
+    # "worker is unreachable" task-fail and self-shutdown. Sequentializing
+    # registrations with a small inter-cluster sleep works around it.
+    # Env-tunable; 2s default proven sufficient. See
+    # tests/hero_scenario_v3/README.md follow-up for the Restate-upgrade
+    # note to revisit.
+    inter_cluster_sleep = float(os.getenv("BOOTSTRAP_INTER_CLUSTER_SLEEP_S", "2"))
+    logger.info("[cm-service] bootstrapping %d edge cluster(s) "
+                "(inter-cluster sleep=%.1fs)",
+                len(edge_clusters), inter_cluster_sleep)
+
+    for i, (edge_id, brokers) in enumerate(edge_clusters):
+        if i > 0 and inter_cluster_sleep > 0:
+            time.sleep(inter_cluster_sleep)
+        cluster_name = f"openddil-{edge_id}"
+        bootstrap_restate_service(
+            service_label=f"cm-service[{edge_id}]",
+            restate_admin_url=RESTATE_ADMIN_URL,
+            service_endpoint=CM_SERVICE_ENDPOINT,
+            kafka_cluster_name=cluster_name,
+            kafka_brokers=brokers,
+            subscriptions=_per_edge_subscriptions(edge_id),
+            timeout_s=BOOTSTRAP_TIMEOUT_S,
+        )
+
+    return 0
 
 
 if __name__ == "__main__":

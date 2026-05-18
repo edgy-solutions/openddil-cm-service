@@ -78,3 +78,13 @@ class AsMaintainedRecord:
     # by `discrepancy_id` (manual entries use uuid5 with a 'manual|' seed
     # so they're identifiable without a schema change).
     manual_discrepancies: list[DiscrepancyRecord] = field(default_factory=list)
+
+    # Origin-node provenance (ADR-0022 / ADR-0023 Phase 6b §A). Populated
+    # from the first observe() event's provenance.edge_id / region_id
+    # (raw-sensor-stream events carry this after Phase 6a). Persisted on
+    # the asset record so subsequent emissions from recheck_compliance /
+    # decommission (which have no fresh inbound event) inherit the
+    # asset's edge attribution. Empty string default for pre-6b records
+    # — projector falls back to its env default with rate-limited WARN.
+    edge_id: str = ""
+    region_id: str = ""

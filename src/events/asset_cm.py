@@ -130,6 +130,15 @@ async def observe(ctx: restate.ObjectContext, event: bytes) -> None:
         # more to do.
         return
 
+    # Phase 6b §A: refresh origin-node provenance from the inbound event so
+    # subsequent emissions from recheck_compliance / decommission inherit
+    # the latest edge attribution.
+    edge_id, region_id = _extract_origin(event)
+    if edge_id:
+        record.edge_id = edge_id
+    if region_id:
+        record.region_id = region_id
+
     record.last_observed_at_ns = now_ns
     if record.lifecycle == am.LIFECYCLE_STALE:
         record.lifecycle = am.LIFECYCLE_ACTIVE  # recovered from stale
@@ -242,6 +251,9 @@ async def _load_or_init(
     # First-seen path. Look up baseline by platform_variant from the event.
     asset = (silver_event or {}).get("asset", {}) or {}
     variant = asset.get("platformVariant") or asset.get("platform_variant") or ""
+    # Phase 6b §A: origin-node provenance for first-emit so the per-asset
+    # row carries real edge attribution from the start.
+    edge_id, region_id = _extract_origin(silver_event)
 
     if not variant or variant == "UNKNOWN":
         logger.warning(
@@ -254,6 +266,8 @@ async def _load_or_init(
             asset_id=asset_id,
             lifecycle=am.LIFECYCLE_REGISTERED,
             last_observed_at_ns=now_ns,
+            edge_id=edge_id,
+            region_id=region_id,
         )
         ctx.set(_KEY_AM_STATE, _record_to_dict(record))
         await _emit_asset_cm_state(ctx, record)
@@ -270,6 +284,8 @@ async def _load_or_init(
             asset_id=asset_id,
             lifecycle=am.LIFECYCLE_REGISTERED,
             last_observed_at_ns=now_ns,
+            edge_id=edge_id,
+            region_id=region_id,
         )
         ctx.set(_KEY_AM_STATE, _record_to_dict(record))
         await _emit_asset_cm_state(ctx, record)
@@ -414,8 +430,15 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     output lands in record.discrepancies — manual entries stay in their
     dedicated list and only merge into the proto wire form via
     store.record_to_proto.
+
+    Phase 6b §A: edge_id/region_id are dataclass-only fields (not in
+    AsMaintainedConfiguration proto), so the proto round-trip below would
+    silently drop them. Preserve and reapply, same pattern as
+    manual_discrepancies.
     """
     preserved_manual = list(record.manual_discrepancies)
+    preserved_edge = record.edge_id
+    preserved_region = record.region_id
 
     if not record.baseline_id:
         record.manual_discrepancies = preserved_manual
@@ -444,6 +467,8 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
 
     out = proto_to_record(proto)
     out.manual_discrepancies = preserved_manual
+    out.edge_id = preserved_edge
+    out.region_id = preserved_region
     return out
 
 
@@ -647,6 +672,10 @@ def _build_cloud_event(
         "current_status": _status_name(current_status),
         "discrepancies": [dataclasses.asdict(d) for d in record.discrepancies],
         "transition_at": _ns_to_iso(now_ns),
+        # Phase 6b §A: projector's tactical_events handler reads edge_id /
+        # region_id from CloudEvent `data` (see resolve_provenance_from_top_level).
+        "edge_id": record.edge_id,
+        "region_id": record.region_id,
     }
     ce = CloudEvent(
         attributes={
@@ -671,6 +700,28 @@ def _record_to_dict(rec: AsMaintainedRecord) -> dict:
     return dataclasses.asdict(rec)
 
 
+def _extract_origin(event: dict | None) -> tuple[str, str]:
+    """Pull origin-node provenance (edge_id, region_id) from a decoded
+    Silver event's provenance block. Returns ("", "") when absent; the
+    projector falls back to its env default with rate-limited WARN.
+
+    Phase 6b §A: cm-service stamps these into the asset-cm-state JSON
+    envelope it emits (top-level edge_id / region_id keys come from
+    _record_to_dict). 6b §A precondition: inbound raw-sensor-stream
+    events have provenance.edge_id populated (Phase 6a).
+
+    Handles BOTH snake_case ('edge_id') and camelCase ('edgeId') because
+    `_decode_silver_event` uses MessageToDict(preserving_proto_field_name=
+    False) → camelCase. Same tolerance pattern as the existing
+    `platform_variant`/`platformVariant` reads in this module."""
+    if not event:
+        return "", ""
+    prov = event.get("provenance") or {}
+    edge = prov.get("edgeId") or prov.get("edge_id") or ""
+    region = prov.get("regionId") or prov.get("region_id") or ""
+    return edge, region
+
+
 def _dict_to_record(d: dict) -> AsMaintainedRecord:
     return AsMaintainedRecord(
         asset_id=d.get("asset_id", ""),
@@ -686,6 +737,8 @@ def _dict_to_record(d: dict) -> AsMaintainedRecord:
         manual_discrepancies=[
             DiscrepancyRecord(**x) for x in d.get("manual_discrepancies", [])
         ],
+        edge_id=d.get("edge_id", ""),
+        region_id=d.get("region_id", ""),
     )
 
 
