@@ -36,6 +36,9 @@ ENV PYTHONPATH=/proto:/app/src
 
 WORKDIR /app
 COPY src /app/src
+# bootstrap/register_subscriptions.py is executed by the cm-service-bootstrap
+# Helm hook Job (same image, command overridden) — bake it into the image.
+COPY bootstrap /app/bootstrap
 
 EXPOSE 8090/tcp
 
