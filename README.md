@@ -91,7 +91,8 @@ to recreate subscriptions after a Restate restart.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CM_BASELINES_DIR` | `/baselines` | Mounted from `openddil-contracts/baselines/` |
+| `CM_BASELINES_DIR` | `/baselines` | Single-directory mount (back-compat). Mounted from `openddil-contracts/baselines/`. |
+| `CM_BASELINES_DIRS` | _(unset)_ | Colon-separated multi-directory list (e.g. `/baselines:/baselines-customer-overlay`). When set, REPLACES `CM_BASELINES_DIR`. Lets customer overlays layer their own baselines on top of the OSS set. Duplicate `platform_variant` across directories is a hard error. |
 | `CM_KAFKA_BROKERS` | `redpanda-edge:9092` | For egress: `asset-cm-state` + `tactical-events` |
 | `CM_HTTP_PORT` | `9080` | Restate ASGI endpoint |
 | `CM_STALENESS_WINDOW_S` | `900` | Telemetry-gap threshold for `LIFECYCLE_STALE` |

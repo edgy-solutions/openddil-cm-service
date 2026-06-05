@@ -7,7 +7,14 @@ Boots:
   3. The Restate AssetCM Virtual Object app on hypercorn ASGI server
 
 Environment:
-  CM_BASELINES_DIR        path to baseline YAMLs (default: /baselines)
+  CM_BASELINES_DIR        single baseline directory; default /baselines.
+                          Back-compat; new deploys should prefer
+                          CM_BASELINES_DIRS for multi-overlay support.
+  CM_BASELINES_DIRS       colon-separated list of baseline directories
+                          (e.g. "/baselines:/baselines-customer-overlay").
+                          When set, REPLACES CM_BASELINES_DIR -- the two
+                          are not merged. Duplicate platform_variant
+                          across directories is a hard error.
   CM_KAFKA_BROKERS        Kafka bootstrap servers (default: redpanda-edge:9092)
   CM_HTTP_PORT            port the Restate endpoint listens on (default: 9080)
   CM_STALENESS_WINDOW_S   staleness threshold in seconds (default: 900)
@@ -28,7 +35,7 @@ from confluent_kafka import Producer, KafkaException
 # Generated proto bindings are on PYTHONPATH (set by Dockerfile)
 sys.path.insert(0, str(Path(__file__).parent))
 
-from baselines.loader import make_registry
+from baselines.loader import make_registry, parse_dirs_env
 from events import asset_cm
 
 logger = logging.getLogger("cm_service.main")
@@ -78,12 +85,20 @@ def _install_kafka_publisher(producer: Producer) -> None:
 
 
 def _install_baselines() -> None:
-    baselines_dir = os.getenv("CM_BASELINES_DIR", "/baselines")
-    registry = make_registry(baselines_dir)
+    # CM_BASELINES_DIRS (multi) takes precedence over CM_BASELINES_DIR
+    # (single, back-compat default). When neither is set, fall back to
+    # the historical default of /baselines so existing single-mount
+    # deploys keep working with no env change.
+    dirs = parse_dirs_env(os.getenv("CM_BASELINES_DIRS"))
+    if not dirs:
+        dirs = [os.getenv("CM_BASELINES_DIR", "/baselines")]
+    registry = make_registry(dirs)
     registry.install_sighup_handler()
     asset_cm.set_baseline_registry(registry)
-    logger.info("Baseline registry installed (%d baseline(s))",
-                len(registry.all_variants()))
+    logger.info("Baseline registry installed (%d baseline(s) from %d dir(s) %s)",
+                len(registry.all_variants()),
+                len(registry.directories()),
+                [str(d) for d in registry.directories()])
 
 
 async def _run_server(producer: Producer) -> None:
