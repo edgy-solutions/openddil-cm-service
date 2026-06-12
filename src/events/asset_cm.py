@@ -121,7 +121,7 @@ async def observe(ctx: restate.ObjectContext, event: bytes) -> None:
     BytesSerde is a pass-through.
     """
     asset_id = ctx.key()
-    now_ns = _now_ns(ctx)
+    now_ns = await _now_ns(ctx)
     event = _decode_silver_event(event)
 
     record = await _load_or_init(ctx, asset_id, event, now_ns)
@@ -165,7 +165,7 @@ async def apply_cm_event(ctx: restate.ObjectContext, event: bytes) -> None:
     `_apply_event_to_record` logic stays JSON-shape friendly.
     """
     asset_id = ctx.key()
-    now_ns = _now_ns(ctx)
+    now_ns = await _now_ns(ctx)
     event = _decode_cm_event(event)
 
     stored = await ctx.get(_KEY_AM_STATE, type_hint=dict)
@@ -192,7 +192,7 @@ async def recheck_compliance(ctx: restate.ObjectContext, _: dict | None = None) 
     """Scheduled callback. Re-runs the analyzer without any new input —
     used to catch mods that became overdue while no telemetry arrived."""
     asset_id = ctx.key()
-    now_ns = _now_ns(ctx)
+    now_ns = await _now_ns(ctx)
 
     stored = await ctx.get(_KEY_AM_STATE, type_hint=dict)
     if stored is None:
@@ -218,7 +218,7 @@ async def decommission(ctx: restate.ObjectContext, reason: dict) -> None:
     """Explicit retirement. Sets lifecycle to DECOMMISSIONED and stops
     scheduling rechecks. State is preserved for audit; not cleared."""
     asset_id = ctx.key()
-    now_ns = _now_ns(ctx)
+    now_ns = await _now_ns(ctx)
     stored = await ctx.get(_KEY_AM_STATE, type_hint=dict)
     if stored is None:
         logger.info("Decommission requested for unknown asset %s", asset_id)
@@ -793,13 +793,25 @@ def _decode_cm_event(raw: bytes | dict | None) -> dict:
 # Small helpers
 # ---------------------------------------------------------------------------
 
-def _now_ns(ctx: restate.ObjectContext) -> int:
-    # ctx.time() returns a `datetime` aligned to Restate's wall clock for
-    # deterministic replay. Fall back to system clock outside Restate (tests).
-    try:
-        return int(ctx.time().timestamp() * 1_000_000_000)
-    except Exception:
-        return int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
+async def _now_ns(ctx: restate.ObjectContext) -> int:
+    # Wall-clock reads inside Restate handlers MUST be journaled or replay
+    # mismatches with VMException(570). The Python SDK has no ctx.time();
+    # ctx.run records the first read and replays it on every retry, so
+    # last_observed_at_ns is identical across replay rounds and the
+    # subsequent ctx.set(...) matches its earlier journal entry.
+    #
+    # Tests inject a StubCtx that DOES expose .time() returning the
+    # pre-stubbed wall clock — honor that first so test assertions on
+    # exact last_observed_at_ns values keep working.
+    if hasattr(ctx, "time"):
+        try:
+            return int(ctx.time().timestamp() * 1_000_000_000)
+        except Exception:
+            pass
+    return await ctx.run(
+        "now_ns",
+        lambda: int(datetime.now(timezone.utc).timestamp() * 1_000_000_000),
+    )
 
 
 def _ns_to_iso(ns: int) -> str:
