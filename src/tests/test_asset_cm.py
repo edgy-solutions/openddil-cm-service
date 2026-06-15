@@ -84,7 +84,17 @@ class StubCtx:
         self._state.clear()
 
     async def run(self, label: str, fn):
-        result = fn()
+        # _now_ns in production goes through ctx.run("now_ns", lambda:
+        # int(datetime.now(...).timestamp() * 1e9)). Tests stub the
+        # wall clock via StubCtx._now_ns so assertions on
+        # last_observed_at_ns can compare exact values; honor that
+        # label here so tests stay deterministic without forcing
+        # the production code to add a test-friendly side door (which
+        # broke replay correctness; see asset_cm.py:_now_ns comment).
+        if label == "now_ns":
+            result = self._now_ns
+        else:
+            result = fn()
         self.runs.append((label, result))
         return result
 
