@@ -795,19 +795,22 @@ def _decode_cm_event(raw: bytes | dict | None) -> dict:
 
 async def _now_ns(ctx: restate.ObjectContext) -> int:
     # Wall-clock reads inside Restate handlers MUST be journaled or replay
-    # mismatches with VMException(570). The Python SDK has no ctx.time();
-    # ctx.run records the first read and replays it on every retry, so
-    # last_observed_at_ns is identical across replay rounds and the
-    # subsequent ctx.set(...) matches its earlier journal entry.
+    # mismatches with VMException(570). Always go through ctx.run -- it
+    # records the first read into the journal and returns the recorded
+    # value on every replay, so last_observed_at_ns is identical across
+    # replay rounds and the subsequent ctx.set(...) matches its earlier
+    # journal entry.
     #
-    # Tests inject a StubCtx that DOES expose .time() returning the
-    # pre-stubbed wall clock — honor that first so test assertions on
-    # exact last_observed_at_ns values keep working.
-    if hasattr(ctx, "time"):
-        try:
-            return int(ctx.time().timestamp() * 1_000_000_000)
-        except Exception:
-            pass
+    # NB: an earlier revision of this function tried `hasattr(ctx, "time")`
+    # to detect the test StubCtx and skip ctx.run for tests. That broke
+    # production because Restate's runtime constructs ObjectContext
+    # DIFFERENTLY between initial-execution and replay (the replay
+    # context exposes additional attributes including `time`). hasattr
+    # returned different answers across attempts within the same
+    # invocation -> divergent control flow -> 570. Always-ctx.run is
+    # the only safe pattern. Tests that need a deterministic clock
+    # mock datetime.now() directly (see src/tests/test_asset_cm.py
+    # for the freezegun-style patch).
     return await ctx.run(
         "now_ns",
         lambda: int(datetime.now(timezone.utc).timestamp() * 1_000_000_000),
