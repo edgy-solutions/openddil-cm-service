@@ -39,6 +39,17 @@ COPY src /app/src
 # bootstrap/register_subscriptions.py is executed by the cm-service-bootstrap
 # Helm hook Job (same image, command overridden) — bake it into the image.
 COPY bootstrap /app/bootstrap
+# cli/submit_cm_event.py is the operator-facing helper used by the
+# customer-bundle's k8s/seed-cm-events.sh demo-iteration script (and by
+# operators paste-and-edit one-liners for manual CmEvent injection).
+# Bake it into the image at /app/cli so `kubectl exec deploy/cm-service
+# -- python /app/cli/submit_cm_event.py ...` works without bind-mounting
+# from a checkout. Same pattern as bootstrap above: small Python entry
+# script the runtime container uses with a different command override.
+# Without this, the seeder fails with "python: can't open file
+# '/app/cli/submit_cm_event.py': [Errno 2] No such file or directory"
+# (observed 2026-06-29 during demo prep).
+COPY cli /app/cli
 
 EXPOSE 8090/tcp
 
