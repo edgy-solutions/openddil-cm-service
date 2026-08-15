@@ -38,6 +38,31 @@ class ModComplianceRecord:
 
 
 @dataclass
+class AdvisoryProvenanceRecord:
+    """Provenance for a discrepancy's `recommended_action` (ADR-0038 C4).
+
+    THIS DATACLASS IS THE WIRE SHAPE, not the proto — asset-cm-state is
+    serialized by `dataclasses.asdict` (ADR-0018 §Amendment 2026-08-15).
+    Field names must match `AdvisoryProvenance` in discrepancy.proto, and
+    every field must have a default: `_dict_to_record` reconstructs from
+    Restate-durable state, so rows written before this existed decode with
+    the defaults. All-default means NO CLAIM — never "trusted", never
+    "human-authored".
+    """
+    basis: int = 0                 # AdvisoryBasis enum value
+    producer: str = ""
+    producer_version: str = ""
+    config_hash: str = ""
+    model_artifact_hash: str = ""
+    rule_id: str = ""
+    inputs: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    confidence_kind: int = 0       # ConfidenceKind enum value
+    limitations: list[int] = field(default_factory=list)  # AdvisoryLimitation
+    generated_at_ns: int = 0
+
+
+@dataclass
 class DiscrepancyRecord:
     discrepancy_id: str
     type: int                  # DiscrepancyType enum value
@@ -47,6 +72,10 @@ class DiscrepancyRecord:
     related_ci_id: str = ""
     related_mod_id: str = ""
     detected_at_ns: int = 0
+    # ADR-0038 C4. Defaulted so pre-provenance durable state still decodes.
+    advisory_provenance: AdvisoryProvenanceRecord = field(
+        default_factory=AdvisoryProvenanceRecord
+    )
 
 
 @dataclass

@@ -39,6 +39,37 @@ from openddil.configuration.v1 import (
     discrepancy_pb2 as disc,
 )
 
+# ---------------------------------------------------------------------------
+# Advisory provenance identity (ADR-0038 C4)
+# ---------------------------------------------------------------------------
+# Stamped onto every `recommended_action` this module produces.
+PRODUCER_NAME = "cm-service/discrepancy-analyzer"
+
+# BUMP THIS when rule SEMANTICS change — a new discrepancy type, a changed
+# severity mapping, different wording that implies different action. It is
+# the answer to "which logic produced this advice?", so a stale value is
+# worse than no value: it attributes today's advice to yesterday's rules.
+# Not tied to the package version, which moves for unrelated reasons.
+ANALYZER_VERSION = "1.0.0"
+
+# Limitations that hold for EVERY advisory this analyzer emits, declared once
+# so a new rule cannot forget them.
+#
+#   NOT_AUTHORITATIVE_ORDER — OpenDDIL proposes; the external maintenance
+#     system of record disposes (ADR-0038 §3). This advisory is not an order
+#     and creates no obligation.
+#   NOT_SAFETY_ASSESSED — a configuration deviation is not a safety-of-use
+#     judgment. This is the same distinction that caps CM-derived severity at
+#     DEGRADED in logistics-fusion: a CM finding never solo-drives "do not
+#     operate" language it has no basis for.
+#   NOT_SCHEDULED — no claim about urgency relative to other outstanding work.
+#     Severity ranks the FINDING, not the queue.
+BASE_LIMITATIONS: tuple[int, ...] = (
+    disc.ADVISORY_LIMITATION_NOT_AUTHORITATIVE_ORDER,
+    disc.ADVISORY_LIMITATION_NOT_SAFETY_ASSESSED,
+    disc.ADVISORY_LIMITATION_NOT_SCHEDULED,
+)
+
 
 class UnknownBaselineError(RuntimeError):
     """Raised when caller asks for discrepancies without a matching baseline."""
@@ -152,6 +183,11 @@ def compute_discrepancies(
 
     out: list[disc.ConfigurationDiscrepancy] = []
 
+    # Advisory provenance binding (ADR-0038 C4). The rules are fixed code;
+    # the baseline is the configuration they are evaluated against, so it is
+    # what a reader needs in order to reproduce a given piece of advice.
+    baseline_ref = f"{baseline.baseline_id}@{baseline.version}"
+
     # --- AuthorizedCi checks -------------------------------------------
     for auth in baseline.authorized_cis:
         installed = installed_by_slot.get(auth.slot_id)
@@ -166,6 +202,10 @@ def compute_discrepancies(
                 recommended_action=f"Install authorized part in slot {auth.slot_id}",
                 related_ci_id="",
                 detected_at_ns=now_ns,
+                rule_id="authorized-ci.slot-empty",
+                inputs=[f"baseline:{baseline.baseline_id}", f"slot:{auth.slot_id}"],
+                extra_limitations=(disc.ADVISORY_LIMITATION_NOT_PARTS_CHECKED,),
+                baseline_ref=baseline_ref,
             ))
             continue
 
@@ -185,6 +225,12 @@ def compute_discrepancies(
                                    f"slot {auth.slot_id}",
                 related_ci_id="",
                 detected_at_ns=now_ns,
+                rule_id="authorized-ci.unverified",
+                inputs=[f"baseline:{baseline.baseline_id}", f"slot:{auth.slot_id}"],
+                # No parts limitation: the advice is to INSPECT, which needs
+                # no parts. Recording only the limitations that apply keeps
+                # the list informative rather than boilerplate.
+                baseline_ref=baseline_ref,
             ))
             continue
 
@@ -206,6 +252,11 @@ def compute_discrepancies(
                                     f"{list(auth.acceptable_part_numbers)}"),
                 related_ci_id=installed.ci_id,
                 detected_at_ns=now_ns,
+                rule_id="authorized-ci.unauthorized-part",
+                inputs=[f"baseline:{baseline.baseline_id}",
+                        f"slot:{auth.slot_id}", f"ci:{installed.ci_id}"],
+                extra_limitations=(disc.ADVISORY_LIMITATION_NOT_PARTS_CHECKED,),
+                baseline_ref=baseline_ref,
             ))
             continue  # if unauthorized, revision check is moot
 
@@ -221,6 +272,11 @@ def compute_discrepancies(
                                     f"{auth.minimum_revision} or later"),
                 related_ci_id=installed.ci_id,
                 detected_at_ns=now_ns,
+                rule_id="authorized-ci.obsolete-revision",
+                inputs=[f"baseline:{baseline.baseline_id}",
+                        f"slot:{auth.slot_id}", f"ci:{installed.ci_id}"],
+                extra_limitations=(disc.ADVISORY_LIMITATION_NOT_PARTS_CHECKED,),
+                baseline_ref=baseline_ref,
             ))
 
     # --- ModificationRequirement checks --------------------------------
@@ -239,6 +295,10 @@ def compute_discrepancies(
                 recommended_action=f"Schedule application of {mod.mod_id}",
                 related_mod_id=mod.mod_id,
                 detected_at_ns=now_ns,
+                rule_id="required-mod.untracked",
+                inputs=[f"baseline:{baseline.baseline_id}", f"mod:{mod.mod_id}"],
+                extra_limitations=(disc.ADVISORY_LIMITATION_NOT_PARTS_CHECKED,),
+                baseline_ref=baseline_ref,
             ))
             continue
 
@@ -269,6 +329,14 @@ def compute_discrepancies(
             recommended_action=action,
             related_mod_id=mod.mod_id,
             detected_at_ns=now_ns,
+            # Distinct rule_ids: the overdue branch escalates severity and
+            # changes the wording, so it is a different piece of advice and
+            # must be attributable as one.
+            rule_id=("required-mod.overdue" if is_overdue
+                     else "required-mod.pending"),
+            inputs=[f"baseline:{baseline.baseline_id}", f"mod:{mod.mod_id}"],
+            extra_limitations=(disc.ADVISORY_LIMITATION_NOT_PARTS_CHECKED,),
+            baseline_ref=baseline_ref,
         ))
 
     return out
@@ -302,6 +370,10 @@ def _make_discrepancy(
     detected_at_ns: int,
     related_ci_id: str = "",
     related_mod_id: str = "",
+    rule_id: str = "",
+    inputs: list[str] | None = None,
+    extra_limitations: tuple[int, ...] = (),
+    baseline_ref: str = "",
 ) -> disc.ConfigurationDiscrepancy:
     d = disc.ConfigurationDiscrepancy()
     # Stable id from (asset, type, related ref) so the same finding across
@@ -319,6 +391,32 @@ def _make_discrepancy(
     ts = Timestamp()
     ts.FromNanoseconds(detected_at_ns)
     d.detected_at.CopyFrom(ts)
+
+    # ---- Advisory provenance (ADR-0038 C4) --------------------------------
+    # `recommended_action` is an advisory: a recommended action presented to
+    # an operator. It shipped for a long time as a bare string, so "why was
+    # this advised?" was answerable only by reading this file at whichever
+    # revision happened to be deployed. Stamp it at emission.
+    prov = d.advisory_provenance
+    prov.basis = disc.ADVISORY_BASIS_RULE
+    prov.producer = PRODUCER_NAME
+    prov.producer_version = ANALYZER_VERSION
+    # The rules are fixed; the BASELINE is what varies per asset and is what
+    # this advice is bound to. Same rules against a different baseline give
+    # different advice, so the baseline reference is this producer's
+    # config_hash in the ADR-0034 sense.
+    prov.config_hash = baseline_ref
+    prov.rule_id = rule_id
+    prov.inputs.extend(inputs or [])
+    # Confidence is deliberately NOT set. These are deterministic rules over
+    # declared inputs — the rule either matched or it did not, and there is
+    # no quantity for a confidence to measure. An unqualified number here
+    # would be a confabulation, and per ADR-0020 §Confidence staircase a
+    # value without a declared KIND is not interpretable anyway. Zero value
+    # plus CONFIDENCE_KIND_UNSPECIFIED reads as "no confidence claim", which
+    # is the accurate statement.
+    prov.limitations.extend(BASE_LIMITATIONS + tuple(extra_limitations))
+    prov.generated_at.CopyFrom(ts)
     return d
 
 

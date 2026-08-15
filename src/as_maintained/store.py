@@ -17,6 +17,7 @@ from openddil.configuration.v1 import (
 )
 
 from .persistence_model import (
+    AdvisoryProvenanceRecord,
     AsMaintainedRecord,
     DiscrepancyRecord,
     InstalledCiRecord,
@@ -65,6 +66,22 @@ def _mod_proto_to_record(p: am.ModCompliance) -> ModComplianceRecord:
     )
 
 
+def _adv_proto_to_record(p: disc.AdvisoryProvenance) -> AdvisoryProvenanceRecord:
+    return AdvisoryProvenanceRecord(
+        basis=int(p.basis),
+        producer=p.producer,
+        producer_version=p.producer_version,
+        config_hash=p.config_hash,
+        model_artifact_hash=p.model_artifact_hash,
+        rule_id=p.rule_id,
+        inputs=list(p.inputs),
+        confidence=float(p.confidence),
+        confidence_kind=int(p.confidence_kind),
+        limitations=[int(x) for x in p.limitations],
+        generated_at_ns=_ts_to_ns(p.generated_at),
+    )
+
+
 def _disc_proto_to_record(p: disc.ConfigurationDiscrepancy) -> DiscrepancyRecord:
     return DiscrepancyRecord(
         discrepancy_id=p.discrepancy_id,
@@ -75,6 +92,7 @@ def _disc_proto_to_record(p: disc.ConfigurationDiscrepancy) -> DiscrepancyRecord
         related_ci_id=p.related_ci_id,
         related_mod_id=p.related_mod_id,
         detected_at_ns=_ts_to_ns(p.detected_at),
+        advisory_provenance=_adv_proto_to_record(p.advisory_provenance),
     )
 
 
@@ -96,9 +114,9 @@ def record_to_proto(rec: AsMaintainedRecord) -> am.AsMaintainedConfiguration:
     # list. The proto has no source distinction; manual entries are
     # identifiable by their `discrepancy_id` prefix ("manual|..." uuid5).
     for d in rec.discrepancies:
-        out.discrepancies.append(_disc_record_to_proto(d))
+        out.discrepancies.append(disc_record_to_proto(d))
     for d in rec.manual_discrepancies:
-        out.discrepancies.append(_disc_record_to_proto(d))
+        out.discrepancies.append(disc_record_to_proto(d))
     out.overall_status = rec.overall_status
     out.lifecycle = rec.lifecycle
     if rec.last_observed_at_ns:
@@ -126,7 +144,20 @@ def _mod_record_to_proto(r: ModComplianceRecord) -> am.ModCompliance:
     return p
 
 
-def _disc_record_to_proto(r: DiscrepancyRecord) -> disc.ConfigurationDiscrepancy:
+def disc_record_to_proto(r: DiscrepancyRecord) -> disc.ConfigurationDiscrepancy:
+    """Record -> proto for a single discrepancy.
+
+    PUBLIC deliberately. `events/asset_cm.py` previously carried a private
+    duplicate of this function (`_disc_record_to_proto_local`) whose only
+    reason to exist was avoiding an underscore-prefixed import — and it
+    silently contradicted this module's own docstring, which claims to be
+    the ONLY place crossing the persistence/computation boundary. Two
+    converters means the next field addition has two chances to be
+    half-applied, and the failure mode is silent partial propagation:
+    manual discrepancies would have lost their provenance while
+    analyzer-computed ones kept it, with nothing failing. Deleted as part
+    of ADR-0038 C4(a), which is the change that exercises every site.
+    """
     p = disc.ConfigurationDiscrepancy()
     p.discrepancy_id = r.discrepancy_id
     p.type = r.type
@@ -137,7 +168,51 @@ def _disc_record_to_proto(r: DiscrepancyRecord) -> disc.ConfigurationDiscrepancy
     p.related_mod_id = r.related_mod_id
     if r.detected_at_ns:
         p.detected_at.CopyFrom(_ns_to_ts(r.detected_at_ns))
+    # Only materialize the submessage when there is provenance to carry.
+    # Setting ANY field on `p.advisory_provenance` marks it PRESENT, so
+    # writing an all-default provenance would turn an absent submessage into
+    # an empty-but-present one and break byte-identical round-tripping —
+    # caught by test_round_trip_preserves_full_state, which is exactly the
+    # kind of thing that assertion exists for. Absent stays absent, which is
+    # also the honest encoding: no claim, rather than an empty claim.
+    if not _adv_is_default(r.advisory_provenance):
+        _adv_record_to_proto_into(r.advisory_provenance, p.advisory_provenance)
     return p
+
+
+def _adv_is_default(r: AdvisoryProvenanceRecord | dict | None) -> bool:
+    """True when the record carries no provenance claim at all."""
+    if r is None:
+        return True
+    if isinstance(r, dict):
+        r = AdvisoryProvenanceRecord(**r)
+    return r == AdvisoryProvenanceRecord()
+
+
+def _adv_record_to_proto_into(r: AdvisoryProvenanceRecord | None,
+                                p: disc.AdvisoryProvenance) -> None:
+    """Fill an AdvisoryProvenance submessage in place.
+
+    Tolerates None and a raw dict: durable state written before this field
+    existed decodes to the dataclass default via `_dict_to_record`, but a
+    caller holding a hand-built record may pass either.
+    """
+    if r is None:
+        return
+    if isinstance(r, dict):  # defensive: un-narrowed durable state
+        r = AdvisoryProvenanceRecord(**r)
+    p.basis = r.basis
+    p.producer = r.producer
+    p.producer_version = r.producer_version
+    p.config_hash = r.config_hash
+    p.model_artifact_hash = r.model_artifact_hash
+    p.rule_id = r.rule_id
+    p.inputs.extend(r.inputs)
+    p.confidence = r.confidence
+    p.confidence_kind = r.confidence_kind
+    p.limitations.extend(r.limitations)
+    if r.generated_at_ns:
+        p.generated_at.CopyFrom(_ns_to_ts(r.generated_at_ns))
 
 
 # ---------------------------------------------------------------------------

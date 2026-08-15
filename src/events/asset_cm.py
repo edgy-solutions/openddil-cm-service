@@ -49,12 +49,13 @@ from openddil.configuration.v1 import (
 from openddil.telemetry.v1 import telemetry_pb2 as tel
 
 from as_maintained.persistence_model import (
+    AdvisoryProvenanceRecord,
     AsMaintainedRecord,
     DiscrepancyRecord,
     InstalledCiRecord,
     ModComplianceRecord,
 )
-from as_maintained.store import proto_to_record, record_to_proto
+from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
 from discrepancy.analyzer import (
     compute_discrepancies,
@@ -461,7 +462,7 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     # Overall status must consider BOTH analyzer-computed and human-raised
     # discrepancies. Merge for the severity reduction only; the analyzer
     # output stays separately addressable on the record.
-    manual_protos = [_disc_record_to_proto_local(d) for d in preserved_manual]
+    manual_protos = [disc_record_to_proto(d) for d in preserved_manual]
     proto.overall_status = overall_status(list(new_discs) + manual_protos)
     proto.as_of.FromNanoseconds(now_ns)
 
@@ -472,23 +473,15 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     return out
 
 
-def _disc_record_to_proto_local(d: DiscrepancyRecord):
-    """Local import-friendly converter (avoids store.py private name)."""
-    from openddil.configuration.v1 import discrepancy_pb2 as _disc
-    p = _disc.ConfigurationDiscrepancy()
-    p.discrepancy_id = d.discrepancy_id
-    p.type = d.type
-    p.description = d.description
-    p.severity = d.severity
-    p.recommended_action = d.recommended_action
-    p.related_ci_id = d.related_ci_id
-    p.related_mod_id = d.related_mod_id
-    if d.detected_at_ns:
-        from google.protobuf.timestamp_pb2 import Timestamp
-        ts = Timestamp()
-        ts.FromNanoseconds(d.detected_at_ns)
-        p.detected_at.CopyFrom(ts)
-    return p
+# `_disc_record_to_proto_local` lived here and was a hand copy of
+# store.disc_record_to_proto, existing only to avoid importing an
+# underscore-prefixed name. Deleted in ADR-0038 C4(a): a second converter is a
+# second chance to half-apply every future field, and the failure mode is
+# SILENT PARTIAL PROPAGATION — manual discrepancies would have lost their
+# advisory provenance while analyzer-computed ones kept it, with nothing
+# raising. It also contradicted store.py's own docstring claim to be the only
+# place crossing the persistence/computation boundary. Call sites now use
+# `store.disc_record_to_proto`, which was made public for exactly this.
 
 
 async def _persist_and_emit_transitions(
@@ -722,6 +715,30 @@ def _extract_origin(event: dict | None) -> tuple[str, str]:
     return edge, region
 
 
+def _disc_from_dict(x: dict) -> DiscrepancyRecord:
+    """Rebuild a DiscrepancyRecord from Restate-durable state.
+
+    `dataclasses.asdict` flattens nested dataclasses to nested DICTS, so a
+    bare `DiscrepancyRecord(**x)` would leave `advisory_provenance` as a
+    plain dict and the record→proto converter would fail on attribute
+    access. The nested field is narrowed explicitly here.
+
+    ADDITIVE-ONLY, and this function is why (ADR-0018 §Amendment
+    2026-08-15): rows written before `advisory_provenance` existed simply
+    lack the key and take the dataclass default, which decodes as "no
+    claim". Removing or renaming a field would instead raise TypeError on
+    an unexpected keyword — at replay time, against durable state.
+    """
+    x = dict(x)
+    adv = x.pop("advisory_provenance", None)
+    rec = DiscrepancyRecord(**x)
+    if isinstance(adv, dict):
+        rec.advisory_provenance = AdvisoryProvenanceRecord(**adv)
+    elif isinstance(adv, AdvisoryProvenanceRecord):
+        rec.advisory_provenance = adv
+    return rec
+
+
 def _dict_to_record(d: dict) -> AsMaintainedRecord:
     return AsMaintainedRecord(
         asset_id=d.get("asset_id", ""),
@@ -729,13 +746,13 @@ def _dict_to_record(d: dict) -> AsMaintainedRecord:
         as_of_ns=d.get("as_of_ns", 0),
         installed=[InstalledCiRecord(**i) for i in d.get("installed", [])],
         mod_status=[ModComplianceRecord(**m) for m in d.get("mod_status", [])],
-        discrepancies=[DiscrepancyRecord(**x) for x in d.get("discrepancies", [])],
+        discrepancies=[_disc_from_dict(x) for x in d.get("discrepancies", [])],
         overall_status=d.get("overall_status", 0),
         lifecycle=d.get("lifecycle", 0),
         last_observed_at_ns=d.get("last_observed_at_ns", 0),
         last_alerted_status=d.get("last_alerted_status", 0),
         manual_discrepancies=[
-            DiscrepancyRecord(**x) for x in d.get("manual_discrepancies", [])
+            _disc_from_dict(x) for x in d.get("manual_discrepancies", [])
         ],
         edge_id=d.get("edge_id", ""),
         region_id=d.get("region_id", ""),
