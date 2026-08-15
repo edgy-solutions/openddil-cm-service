@@ -261,7 +261,7 @@ def test_reload_picks_up_changes_in_any_configured_dir(tmp_path):
     assert sorted(reg.all_variants()) == ["A-VARIANT", "B-VARIANT"]
 
 
-def test_customer-overlay_baselines_layer_cleanly_on_real_oss_baselines(tmp_path):
+def test_customer_overlay_baselines_layer_cleanly_on_real_oss_baselines(tmp_path):
     """End-to-end-shape test: simulate the production layering by reading
     the real OSS baselines + a fake-customer overlay together. Catches
     accidental variant collisions before they ship.
