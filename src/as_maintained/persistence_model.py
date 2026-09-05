@@ -117,3 +117,22 @@ class AsMaintainedRecord:
     # — projector falls back to its env default with rate-limited WARN.
     edge_id: str = ""
     region_id: str = ""
+
+    # Coalition releasability labels (ADR-0029 §3). Same lifecycle as
+    # edge_id / region_id above: taken from the first observe() event's
+    # provenance and persisted on the record, so emissions from
+    # recheck_compliance / decommission — which have no fresh inbound event
+    # — still carry them.
+    #
+    # PROPAGATED, NEVER DERIVED. cm-service holds no releasability
+    # declaration and must not acquire one; the label is stamped once at
+    # ingress. What cm-service contributes is the join from asset to
+    # configuration record.
+    #
+    # Empty default, and empty means UNLABELLED — the ADR-0029 §7
+    # completeness gate counts such a row. That is deliberate: a
+    # configuration record for an asset nobody declared should fail the
+    # gate, not quietly acquire a nation from whichever service noticed it
+    # last. Pre-ADR-0029 records decode with the default, as with edge_id.
+    originator_nation: str = ""
+    releasable_to: list[str] = field(default_factory=list)

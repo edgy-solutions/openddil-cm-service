@@ -140,6 +140,16 @@ async def observe(ctx: restate.ObjectContext, event: bytes) -> None:
     if region_id:
         record.region_id = region_id
 
+    # ADR-0029 §3: same refresh, same stickiness. Once an asset's nation is
+    # known it is not cleared by a later event that omits it — an asset does
+    # not change nationality because one message was thin, and clearing on
+    # absence would make the §7 gate flicker with feed hiccups. Relabelling
+    # requires a positive statement.
+    nation, releasable = _extract_releasability(event)
+    if nation:
+        record.originator_nation = nation
+        record.releasable_to = releasable
+
     record.last_observed_at_ns = now_ns
     if record.lifecycle == am.LIFECYCLE_STALE:
         record.lifecycle = am.LIFECYCLE_ACTIVE  # recovered from stale
@@ -437,9 +447,22 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     silently drop them. Preserve and reapply, same pattern as
     manual_discrepancies.
     """
+    # DATACLASS-ONLY FIELDS SURVIVE THE PROTO ROUND-TRIP ONLY BY BEING
+    # LISTED HERE. `record -> proto -> record` drops anything the proto does
+    # not carry, so every field added to AsMaintainedRecord that is not in
+    # AsMaintainedConfiguration must be preserved explicitly. Forgetting one
+    # is SILENT PARTIAL PROPAGATION — the failure this function's own
+    # ADR-0038 C4(a) note already describes, arriving from the other
+    # direction.
+    #
+    # For releasability specifically the symptom would be: labels correct
+    # until the first recompute, then NULL, and a §7 gate that passes and
+    # later fails with no code change in between.
     preserved_manual = list(record.manual_discrepancies)
     preserved_edge = record.edge_id
     preserved_region = record.region_id
+    preserved_nation = record.originator_nation
+    preserved_releasable = list(record.releasable_to)
 
     if not record.baseline_id:
         record.manual_discrepancies = preserved_manual
@@ -470,6 +493,8 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     out.manual_discrepancies = preserved_manual
     out.edge_id = preserved_edge
     out.region_id = preserved_region
+    out.originator_nation = preserved_nation
+    out.releasable_to = preserved_releasable
     return out
 
 
@@ -693,6 +718,26 @@ def _record_to_dict(rec: AsMaintainedRecord) -> dict:
     return dataclasses.asdict(rec)
 
 
+def _extract_releasability(event: dict | None) -> tuple[str, list[str]]:
+    """Pull ADR-0029 releasability labels from a decoded Silver event.
+
+    Sibling of _extract_origin below, with the same camelCase/snake_case
+    tolerance and for the same reason. Kept separate rather than folded in,
+    because the two have DIFFERENT absence rules: a missing edge_id
+    legitimately falls back to the projector's env default, a missing label
+    must never fall back to anything.
+
+    Returns ("", []) when absent. An empty releasable_to beside a real
+    nation is a legitimate posture (released to nobody further), not an
+    absence — only the nation decides labelled vs unlabelled."""
+    if not event:
+        return "", []
+    prov = event.get("provenance") or {}
+    nation = prov.get("originatorNation") or prov.get("originator_nation") or ""
+    releasable = prov.get("releasableTo") or prov.get("releasable_to") or []
+    return nation, list(releasable)
+
+
 def _extract_origin(event: dict | None) -> tuple[str, str]:
     """Pull origin-node provenance (edge_id, region_id) from a decoded
     Silver event's provenance block. Returns ("", "") when absent; the
@@ -756,7 +801,29 @@ def _dict_to_record(d: dict) -> AsMaintainedRecord:
         ],
         edge_id=d.get("edge_id", ""),
         region_id=d.get("region_id", ""),
+        originator_nation=d.get("originator_nation", ""),
+        releasable_to=list(d.get("releasable_to", [])),
     )
+
+
+# THE ASYMMETRY ABOVE IS THE HAZARD, AND IT IS WORTH NAMING.
+# `_record_to_dict` is `dataclasses.asdict` — automatic, total, and it picks
+# up every new field for free. Its inverse is this hand-written constructor,
+# which picks up nothing. So a field added to AsMaintainedRecord SERIALISES
+# OUT CORRECTLY AND VANISHES ON THE WAY BACK IN, and the round-trip only
+# fails on the SECOND event for an asset — the first works because the record
+# is still in memory.
+#
+# Releasability hit this exactly: labels stored, emitted, visible in the
+# envelope, and gone after the next observe. Caught by a test, not by
+# reading, because reading `_record_to_dict` tells you nothing about its
+# inverse.
+#
+# THREE PLACES now need a new dataclass-only field: the dataclass, this
+# function, and the preservation block in `_recompute`. That is a
+# coordination hazard, not a design; recorded as a follow-up rather than
+# refactored here, because changing state (de)serialisation deserves its own
+# change with its own migration reasoning about records already persisted.
 
 
 # ---------------------------------------------------------------------------

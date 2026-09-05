@@ -432,3 +432,76 @@ def test_decommission_stops_recheck_scheduling(install_registry_and_publisher):
     asyncio.run(decommission(ctx, {"reason": "retired"}))
     # No new recheck schedules after decommission
     assert ctx.scheduled == []
+
+
+# ---------------------------------------------------------------------------
+# Releasability labels (ADR-0029 §3) — propagated, never derived
+# ---------------------------------------------------------------------------
+
+def _labelled_event(nation: str = "ATL", releasable=("BDR",)) -> dict:
+    ev = _silver_event_dict()
+    ev["provenance"]["originatorNation"] = nation
+    ev["provenance"]["releasableTo"] = list(releasable)
+    return ev
+
+
+def test_observe_stores_releasability_labels(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event()))
+    state = ctx._state["am_state"]
+    assert state["originator_nation"] == "ATL"
+    assert state["releasable_to"] == ["BDR"]
+
+
+def test_unlabelled_event_leaves_record_unlabelled(install_registry_and_publisher):
+    """cm-service must NOT invent a nation for an asset nobody declared. The
+    §7 completeness gate is supposed to catch that; a default here would hide
+    exactly what the gate exists to surface, and the fix belongs at the
+    ingress that failed to declare the asset."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    state = ctx._state["am_state"]
+    assert state["originator_nation"] == ""
+    assert state["releasable_to"] == []
+
+
+def test_labels_reach_the_emitted_cm_state_envelope(install_registry_and_publisher):
+    """asset-cm-state is JSON (ADR-0018) built by dataclasses.asdict, so the
+    labels land at the ENVELOPE'S TOP LEVEL — which is the exact shape the
+    projector's cm_state handler reads. Pinned here because the two repos
+    agree on that shape by convention and nothing else enforces it."""
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event()))
+    payload = next(json.loads(p[2]) for p in published if p[0] == "asset-cm-state")
+    assert payload["originator_nation"] == "ATL"
+    assert payload["releasable_to"] == ["BDR"]
+
+
+def test_labels_survive_recompute(install_registry_and_publisher):
+    """THE TRAP. `record -> proto -> record` drops every dataclass-only
+    field, so labels survive a recompute only by being named in the
+    preservation block. Forgetting one is silent partial propagation: labels
+    correct until the first recompute, then NULL, and a §7 gate that passes
+    and later fails with no code change in between.
+
+    recheck_compliance is the cheapest path through _recompute; edge_id is
+    asserted alongside so a future edit that drops BOTH cannot pass by
+    accident."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event()))
+    assert ctx._state["am_state"]["originator_nation"] == "ATL"
+
+    asyncio.run(recheck_compliance(ctx, b""))
+    state = ctx._state["am_state"]
+    assert state["originator_nation"] == "ATL", "labels dropped by recompute"
+    assert state["releasable_to"] == ["BDR"]
+
+
+def test_labels_are_sticky_across_a_thin_event(install_registry_and_publisher):
+    """An asset does not change nationality because one message was thin.
+    Clearing on absence would make the §7 gate flicker with feed hiccups."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event()))
+    asyncio.run(observe(ctx, _silver_event_dict()))     # no labels this time
+    assert ctx._state["am_state"]["originator_nation"] == "ATL"
