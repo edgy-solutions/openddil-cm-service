@@ -20,6 +20,8 @@ import time
 from openddil_bootstrap.restate_subscriptions import (
     Subscription,
     bootstrap_restate_service,
+    group_prefix_owner,
+    prune_subscriptions,
 )
 
 logger = logging.getLogger("cm_service.bootstrap")
@@ -97,6 +99,7 @@ def main() -> int:
                 "(inter-cluster sleep=%.1fs)",
                 len(edge_clusters), inter_cluster_sleep)
 
+    desired: list[tuple[str, Subscription]] = []
     for i, (edge_id, brokers) in enumerate(edge_clusters):
         if i > 0 and inter_cluster_sleep > 0:
             time.sleep(inter_cluster_sleep)
@@ -110,6 +113,32 @@ def main() -> int:
             subscriptions=_per_edge_subscriptions(edge_id),
             timeout_s=BOOTSTRAP_TIMEOUT_S,
         )
+        desired.extend((cluster_name, sub)
+                        for sub in _per_edge_subscriptions(edge_id))
+
+    # ------------------------------------------------------------------
+    # PRUNE (UD-12). Registration above can only ADD; without this, a
+    # subscription retired from CM_EDGE_CLUSTERS keeps running forever.
+    #
+    # That is not hypothetical: the detection cutover retires this
+    # service's downward subscription for any edge that gains a tier node,
+    # and until now "retired" meant only "not re-created" -- true solely
+    # because `hook-restate-wipe` deletes the root's Restate PVC on every
+    # upgrade under `restate.ephemeralOnUpgrade`, a flag the chart itself
+    # documents as `false` for prod-like use. In that configuration the old
+    # subscription survives the upgrade, the root keeps consuming a
+    # tier-managed edge's raw stream, and UD-10 returns with every
+    # render-time guard still green.
+    #
+    # Runs once, after the loop, with the complete set: pruning inside the
+    # loop would delete the clusters not yet registered.
+    # ------------------------------------------------------------------
+    prune_subscriptions(
+        restate_admin_url=RESTATE_ADMIN_URL,
+        desired=desired,
+        owns=group_prefix_owner("cm-service-"),
+        scope_label="cm-service",
+    )
 
     return 0
 
