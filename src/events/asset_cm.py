@@ -694,6 +694,33 @@ def _build_cloud_event(
         # region_id from CloudEvent `data` (see resolve_provenance_from_top_level).
         "edge_id": record.edge_id,
         "region_id": record.region_id,
+        # ADR-0029 §3: CARRY the labels the record already holds.
+        #
+        # THEY WERE MISSING HERE AND NOWHERE ELSE. The record has carried
+        # originator_nation/releasable_to since ingest, and the rest of this
+        # module is careful with them -- they are preserved across a baseline
+        # swap (see preserved_nation/preserved_releasable) precisely so a
+        # config change cannot silently relabel an asset. This one dict, the
+        # only place the labels leave the service, did not include them.
+        #
+        # The projector is not allowed to help. `releasability_from` has no
+        # fallback, no default and no lookup by design (ADR-0029 §3: a second
+        # place that can decide a label is a second answer to a question that
+        # must have exactly one), so an unstamped event lands with both
+        # columns NULL and stays that way.
+        #
+        # Invisible until 2026-09-17: `tactical_events` was EMPTY for as long
+        # as the derive stage was dead, so the completeness gate had never run
+        # against a row from this producer. The gate was green over zero rows.
+        #
+        # Empty list is a real value, not a gap. A declared nation with no
+        # additional release is the ordinary coalition posture -- the
+        # originator's own access comes from the first clause of the §4
+        # disjunction -- so `[]` labels the row on both columns while NULL
+        # leaves it unlabelled. Do not "fix" an empty releasable_to into a
+        # nation list here.
+        "originator_nation": record.originator_nation,
+        "releasable_to": list(record.releasable_to),
     }
     ce = CloudEvent(
         attributes={

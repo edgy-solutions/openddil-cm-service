@@ -478,6 +478,83 @@ def test_labels_reach_the_emitted_cm_state_envelope(install_registry_and_publish
     assert payload["releasable_to"] == ["BDR"]
 
 
+def test_labels_reach_the_tactical_event(install_registry_and_publisher):
+    """THE DEFECT OF 2026-09-17, pinned.
+
+    The record carried originator_nation/releasable_to from ingest, the
+    cm-state envelope carried them (test above), the recompute preserved them
+    (test below) -- and the ONE dict that builds the tactical-events
+    CloudEvent did not include them. Three rows reached `tactical_events`
+    with both label columns NULL.
+
+    The projector cannot compensate and must not: `releasability_from` has no
+    fallback by design (ADR-0029 §3), so an unstamped event stays unlabelled
+    forever.
+
+    WHY NOTHING CAUGHT IT FOR MONTHS: `tactical_events` was EMPTY the whole
+    time the derive stage was dead, so the §7 completeness gate -- which does
+    check this table -- had never seen a row from this producer. The gate was
+    green over zero rows. A table that is empty for the wrong reason is not
+    covered by the check that reads it.
+    """
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event()))
+
+    tactical = [p for p in published if p[0] == "tactical-events"]
+    assert len(tactical) == 1
+    data = json.loads(tactical[0][2])["data"]
+    assert data["originator_nation"] == "ATL"
+    assert data["releasable_to"] == ["BDR"]
+
+
+def test_tactical_event_keeps_empty_releasable_to_as_a_value(
+    install_registry_and_publisher,
+):
+    """An empty releasable_to is a REAL LABEL, not a gap.
+
+    A declared nation with no additional release is the ordinary coalition
+    posture -- the originator's own access comes from the first clause of the
+    ADR-0029 §4 disjunction. The row must be labelled on BOTH columns so the
+    completeness gate can tell "releasable to nobody else" from "nobody ever
+    said", which are different facts with different remedies.
+
+    Guards against a well-meaning future edit that treats [] as missing and
+    substitutes the nation, silently widening an asset's audience.
+    """
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _labelled_event(nation="ATL", releasable=())))
+
+    data = json.loads(
+        next(p[2] for p in published if p[0] == "tactical-events")
+    )["data"]
+    assert data["originator_nation"] == "ATL"
+    assert data["releasable_to"] == []
+
+
+def test_unlabelled_asset_yields_unlabelled_tactical_event(
+    install_registry_and_publisher,
+):
+    """The must-NOT-fire half. cm-service may not invent a nation for an
+    asset nobody declared -- not on the record, and not on the way out.
+
+    Without this, a fix for the defect above could be written as "default the
+    nation" and pass, which would hide undeclared assets from the gate that
+    exists to find them. The remedy for an unlabelled event is at the ingress
+    that failed to declare the asset.
+    """
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    data = json.loads(
+        next(p[2] for p in published if p[0] == "tactical-events")
+    )["data"]
+    assert data["originator_nation"] == ""
+    assert data["releasable_to"] == []
+
+
 def test_labels_survive_recompute(install_registry_and_publisher):
     """THE TRAP. `record -> proto -> record` drops every dataclass-only
     field, so labels survive a recompute only by being named in the
