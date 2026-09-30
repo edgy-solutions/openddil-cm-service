@@ -135,9 +135,10 @@ async def observe(ctx: restate.ObjectContext, event: bytes) -> None:
     event = _decode_silver_event(event)
 
     if _is_removal(event) and await ctx.get(_KEY_AM_STATE, type_hint=dict) is None:
-        # Upstream's kind-gate is becoming stateless (every Remove Entity
-        # passes by PDU type alone, with no per-asset "have we seen this
-        # one" check). Without this guard, `_load_or_init` below treats a
+        # The ingress kind gate passes every Remove Entity by PDU type
+        # alone; it keeps no record of which asset ids it admitted, so this
+        # is where a removal is resolved against the ids that exist.
+        # Without this guard, `_load_or_init` below treats a
         # removal for a never-seen asset_id as a first-seen event and
         # registers a minimal visible record for an asset that never
         # existed here — a removal would CREATE an asset. Drop it instead;
