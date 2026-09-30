@@ -151,6 +151,29 @@ def _silver_event_dict(
     }
 
 
+def _removal_event_dict(asset_id: str = "dis:1:1:4773") -> dict:
+    """A DIS Remove Entity PDU decoded to the Silver event shape: no
+    kinematics, no platform_variant, operational_state.operational_status
+    = OPERATIONAL_STATUS_REMOVED. This is the shape `_decode_silver_event`
+    produces for protobuf-binary input (MessageToDict camelCase, enum
+    rendered as its NAME string) — see asset_cm._is_removal's docstring
+    for the other shapes the guard also has to tolerate."""
+    return {
+        "eventId": "test-evt-removal",
+        "asset": {
+            "assetId": asset_id,
+        },
+        "operationalState": {
+            "operationalStatus": "OPERATIONAL_STATUS_REMOVED",
+        },
+        "provenance": {
+            "producerId": "dis-ingestor-binary",
+            "sourceProtocol": "DIS/IEEE-1278.1-binary",
+        },
+        "schemaRevision": 1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # observe() — first-seen path
 # ---------------------------------------------------------------------------
@@ -226,6 +249,59 @@ def test_observe_idempotent_no_extra_alert(install_registry_and_publisher):
     assert len(tactical) == 1, (
         "Second observe() with no state change must not emit a second alert"
     )
+
+
+# ---------------------------------------------------------------------------
+# observe() — Remove Entity (operational_status = OPERATIONAL_STATUS_REMOVED)
+# ---------------------------------------------------------------------------
+
+def test_observe_removal_for_unknown_asset_is_dropped(install_registry_and_publisher):
+    """A Remove Entity for an asset_id with no existing AssetCM state must be
+    dropped before `_load_or_init` runs, not treated as first-seen
+    registration. Without the guard, `_load_or_init` sees no
+    platform_variant (removals carry none) and registers a minimal visible
+    record — a removal would CREATE an asset."""
+    published = install_registry_and_publisher
+    from metrics import cm_removal_unknown_asset_dropped_total as counter
+    before = counter._value.get()
+
+    ctx = StubCtx(key="dis:9:9:0001", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _removal_event_dict(asset_id="dis:9:9:0001")))
+
+    assert "am_state" not in ctx._state, "no state may be set for the dropped removal"
+    assert published == [], "no emission for the dropped removal"
+    assert counter._value.get() == before + 1
+
+
+def test_observe_removal_for_existing_asset_follows_existing_path(
+    install_registry_and_publisher,
+):
+    """A Remove Entity for an asset we already have AssetCM state for is
+    NOT covered by the new guard — it must still update and persist state
+    the same way any other observe() call does today."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    first_observed = ctx._state["am_state"]["last_observed_at_ns"]
+
+    ctx._now_ns += 10 * 1_000_000_000   # 10 seconds later
+    asyncio.run(observe(ctx, _removal_event_dict(asset_id="dis:1:1:4773")))
+
+    assert ctx._state["am_state"]["last_observed_at_ns"] > first_observed, (
+        "existing-key path must still update/persist state as today"
+    )
+
+
+def test_observe_non_removal_first_seen_still_initializes(
+    install_registry_and_publisher,
+):
+    """Sanity check the new guard is removal-specific: an ordinary
+    first-seen event (not a removal) must still take the existing
+    first-seen registration path unchanged."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    assert "am_state" in ctx._state
+    assert ctx._state["am_state"]["lifecycle"] == am.LIFECYCLE_ACTIVE
 
 
 # ---------------------------------------------------------------------------

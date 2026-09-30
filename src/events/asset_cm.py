@@ -62,8 +62,17 @@ from discrepancy.analyzer import (
     initialize_from_baseline,
     overall_status,
 )
+from metrics import cm_removal_unknown_asset_dropped_total
 
 logger = logging.getLogger("cm_service.asset_cm")
+
+# Name of the OperationalStatus enum value that marks an entity as removed
+# (DIS Remove Entity PDU, ADR-0044 lifecycle slice "A"). Read off the
+# generated enum rather than hardcoded so a proto renumber can't silently
+# desync this from tel.OPERATIONAL_STATUS_REMOVED.
+_OPERATIONAL_STATUS_REMOVED_NAME = tel.OperationalStatus.Name(
+    tel.OPERATIONAL_STATUS_REMOVED
+)
 
 # Staleness window — if no telemetry arrives within this many seconds the
 # asset transitions to LIFECYCLE_STALE.
@@ -124,6 +133,23 @@ async def observe(ctx: restate.ObjectContext, event: bytes) -> None:
     asset_id = ctx.key()
     now_ns = await _now_ns(ctx)
     event = _decode_silver_event(event)
+
+    if _is_removal(event) and await ctx.get(_KEY_AM_STATE, type_hint=dict) is None:
+        # Upstream's kind-gate is becoming stateless (every Remove Entity
+        # passes by PDU type alone, with no per-asset "have we seen this
+        # one" check). Without this guard, `_load_or_init` below treats a
+        # removal for a never-seen asset_id as a first-seen event and
+        # registers a minimal visible record for an asset that never
+        # existed here — a removal would CREATE an asset. Drop it instead;
+        # a removal for an asset we DO have state for still follows the
+        # normal path unchanged (its lifecycle handling is unaffected by
+        # this change).
+        cm_removal_unknown_asset_dropped_total.inc()
+        logger.info(
+            "Dropping Remove Entity for asset %s: no existing AssetCM state",
+            asset_id,
+        )
+        return
 
     record = await _load_or_init(ctx, asset_id, event, now_ns)
     if record is None:
@@ -743,6 +769,35 @@ def _build_cloud_event(
 
 def _record_to_dict(rec: AsMaintainedRecord) -> dict:
     return dataclasses.asdict(rec)
+
+
+def _is_removal(event: dict | None) -> bool:
+    """True when the decoded Silver event asserts
+    OperationalStatus.OPERATIONAL_STATUS_REMOVED (a DIS Remove Entity PDU
+    seen by the upstream kind gate, ADR-0044 lifecycle slice "A").
+
+    `_decode_silver_event` produces different shapes depending on which
+    wire format it decoded:
+      - protobuf-binary (raw-sensor-stream, the production path):
+        MessageToDict(preserving_proto_field_name=False) -> camelCase keys
+        ("operationalState" / "operationalStatus"), enum rendered as its
+        NAME string ("OPERATIONAL_STATUS_REMOVED").
+      - JSON (direct Restate ingress, tests, hand-built fixtures): may be
+        snake_case OR camelCase, and the enum may be the NAME string or
+        the raw int (4), depending on how the JSON was produced. Accept
+        both casings and both enum representations rather than assume one
+        — this mirrors the platform_variant / provenance tolerance used
+        elsewhere in this module.
+    """
+    if not event:
+        return False
+    state = event.get("operationalState") or event.get("operational_state")
+    if not isinstance(state, dict):
+        return False
+    status = state.get("operationalStatus")
+    if status is None:
+        status = state.get("operational_status")
+    return status == _OPERATIONAL_STATUS_REMOVED_NAME or status == tel.OPERATIONAL_STATUS_REMOVED
 
 
 def _extract_releasability(event: dict | None) -> tuple[str, list[str]]:
