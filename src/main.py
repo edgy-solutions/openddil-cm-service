@@ -20,6 +20,7 @@ Environment:
   CM_STALENESS_WINDOW_S   staleness threshold in seconds (default: 900)
   CM_RECHECK_MIN_DELAY_S  minimum delay between rechecks (default: 30)
   LOG_LEVEL               INFO / DEBUG / WARN (default: INFO)
+  METRICS_PORT            Prometheus /metrics HTTP port (default: 9464)
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ import signal
 import sys
 from pathlib import Path
 
+import prometheus_client
 from confluent_kafka import Producer, KafkaException
 
 # Generated proto bindings are on PYTHONPATH (set by Dockerfile)
@@ -150,8 +152,20 @@ async def _run_server(producer: Producer) -> None:
                             remaining)
 
 
+def _start_metrics_server() -> None:
+    port = int(os.environ.get("METRICS_PORT", "9464"))
+    try:
+        prometheus_client.start_http_server(port)
+        logger.info("Prometheus metrics server listening on :%d", port)
+    except OSError as exc:
+        # Non-fatal: a taken port (e.g. a second local instance during dev)
+        # should not stop the service from serving its actual traffic.
+        logger.warning("Could not start metrics server on :%d: %s", port, exc)
+
+
 def main() -> None:
     _configure_logging()
+    _start_metrics_server()
     _install_baselines()
     producer = _build_producer()
     _install_kafka_publisher(producer)
