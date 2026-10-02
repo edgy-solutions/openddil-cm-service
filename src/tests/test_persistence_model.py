@@ -220,3 +220,71 @@ def test_durable_state_written_before_provenance_existed_still_loads():
     rec2 = _disc_from_dict(current)
     assert isinstance(rec2.advisory_provenance, AdvisoryProvenanceRecord)
     assert rec2.advisory_provenance.producer == "x"
+
+
+# ---------------------------------------------------------------------------
+# component / fault_code / sources are additive -- old durable dicts
+# must still decode, and a dict WITH sources must round-trip back into
+# DiscrepancySourceRecord objects (not stay nested dicts). Same ASYMMETRY
+# hazard advisory_provenance has; see events/asset_cm.py's
+# "THE ASYMMETRY ABOVE IS THE HAZARD" comment.
+# ---------------------------------------------------------------------------
+
+def test_durable_state_written_before_discrepancy_sources_existed_still_loads():
+    """A dict with no component/fault_code/sources keys
+    (durable state from before episode keying) must still decode, taking the dataclass
+    defaults -- empty strings and an empty sources list."""
+    from events.asset_cm import _disc_from_dict
+
+    legacy = {
+        "discrepancy_id": "abc", "type": 1, "description": "old row",
+        "severity": 3, "recommended_action": "Apply MWO-2026-001",
+        "related_ci_id": "", "related_mod_id": "MWO-2026-001",
+        "detected_at_ns": 1_700_000_000_000_000_000,
+    }
+    rec = _disc_from_dict(legacy)
+    assert rec.component == ""
+    assert rec.fault_code == ""
+    assert rec.sources == []
+
+
+def test_discrepancy_sources_round_trip_record_to_dict_and_back():
+    """A dict with `sources` populated (what
+    `_record_to_dict` writes today) must round-trip through `_record_to_dict`
+    -> `_dict_to_record` into equal DiscrepancySourceRecord objects -- not
+    stay nested dicts, which would break the record -> proto bridge the same
+    way an un-narrowed advisory_provenance would."""
+    from events.asset_cm import _dict_to_record, _record_to_dict
+    from as_maintained.persistence_model import (
+        AsMaintainedRecord,
+        DiscrepancyRecord,
+        DiscrepancySourceRecord,
+    )
+
+    source = DiscrepancySourceRecord(
+        source="telemetry_bit",
+        reported_by="operator.atlantia",
+        event_id="evt-1",
+        reported_at_ns=1_700_000_000_000_000_000,
+        description="FCS computer BIT fault",
+    )
+    disc_rec = DiscrepancyRecord(
+        discrepancy_id="episode-1",
+        type=disc.DISCREPANCY_UNSPECIFIED,
+        description="FCS computer BIT fault",
+        severity=disc.SEVERITY_MAJOR,
+        recommended_action="Swap FCS computer",
+        component="fcs-computer",
+        fault_code="F-1234",
+        sources=[source],
+    )
+    record = AsMaintainedRecord(
+        asset_id="dis:1:1:4773",
+        manual_discrepancies=[disc_rec],
+    )
+
+    round_tripped = _dict_to_record(_record_to_dict(record))
+
+    rt_sources = round_tripped.manual_discrepancies[0].sources
+    assert rt_sources == [source]
+    assert isinstance(rt_sources[0], DiscrepancySourceRecord)

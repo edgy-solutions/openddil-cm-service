@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from openddil.configuration.v1 import (
     as_maintained_pb2 as am,
+    cm_events_pb2 as cme,
     configuration_baseline_pb2 as cb,
     discrepancy_pb2 as disc,
 )
@@ -37,6 +38,7 @@ from events.asset_cm import (
     observe,
     recheck_compliance,
 )
+from events.asset_cm import _decode_cm_event
 
 
 REAL_BASELINES_DIR = (
@@ -658,3 +660,213 @@ def test_labels_are_sticky_across_a_thin_event(install_registry_and_publisher):
     asyncio.run(observe(ctx, _labelled_event()))
     asyncio.run(observe(ctx, _silver_event_dict()))     # no labels this time
     assert ctx._state["am_state"]["originator_nation"] == "ATL"
+
+
+# ---------------------------------------------------------------------------
+# Episode-keyed manual discrepancies (fault_code groups reports; sources
+# counted, not duplicated). ADR-0018 §Amendment 2026-08-15.
+# ---------------------------------------------------------------------------
+
+def _episode_cm_event(
+    *,
+    event_id: str,
+    recorded_by: str,
+    source: str,
+    component: str = "fcs-computer",
+    fault_code: str = "F-1234",
+    description: str = "FCS computer BIT fault",
+    severity: str = "MAJOR",
+) -> dict:
+    return {
+        "eventId": event_id,
+        "recordedBy": recorded_by,
+        "manualDiscrepancy": {
+            "description": description,
+            "severity": severity,
+            "recommendedAction": "Swap FCS computer",
+            "source": source,
+            "component": component,
+            "faultCode": fault_code,
+        },
+    }
+
+
+def test_manual_discrepancy_episode_merges_sources_not_duplicates(
+    install_registry_and_publisher,
+):
+    """Two reports of the same (asset, component, fault_code) episode
+    from different sources/event_ids merge into ONE manual discrepancy with
+    BOTH sources recorded -- not two separate findings."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-2", recorded_by="telemetry-ingest",
+        source="telemetry_bit",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    sources = manual[0]["sources"]
+    assert len(sources) == 2
+    by_source = {s["source"] for s in sources}
+    assert by_source == {"operator_report", "telemetry_bit"}
+    operator_entry = next(s for s in sources if s["source"] == "operator_report")
+    assert operator_entry["reported_by"] == "operator.atlantia"
+
+
+def test_manual_discrepancy_episode_redelivery_is_a_no_op(
+    install_registry_and_publisher,
+):
+    """Same key, same event_id twice -> 1 discrepancy, 1 source. A
+    redelivery of the identical CM event must not double-count a source."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    payload = _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report",
+    )
+    asyncio.run(apply_cm_event(ctx, dict(payload)))
+    asyncio.run(apply_cm_event(ctx, dict(payload)))  # redelivery
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert len(manual[0]["sources"]) == 1
+
+
+def test_manual_discrepancy_episode_different_fault_code_is_a_separate_discrepancy(
+    install_registry_and_publisher,
+):
+    """Same asset and component, different fault_code -> 2
+    discrepancies. fault_code, not just component, keys the episode."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", fault_code="F-1234",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-2", recorded_by="operator.atlantia",
+        source="operator_report", fault_code="F-5678",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 2
+
+
+def test_manual_discrepancy_without_fault_code_keeps_todays_id_and_no_sources(
+    install_registry_and_publisher,
+):
+    """No fault_code -> today's path, byte-identical: id is
+    uuid5(NAMESPACE_URL, "manual|<asset>|<description>") and sources == []."""
+    import uuid as uuid_mod
+
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    description = "Visual: hatch hinge cracked"
+    asyncio.run(apply_cm_event(ctx, {
+        "eventId": "evt-1",
+        "recordedBy": "operator.atlantia",
+        "manualDiscrepancy": {
+            "description": description,
+            "severity": "MAJOR",
+            "recommendedAction": "Replace hatch assembly",
+        },
+    }))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    expected_id = str(uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL,
+        f"manual|dis:1:1:4773|{description}",
+    ))
+    assert manual[0]["discrepancy_id"] == expected_id
+    assert manual[0]["sources"] == []
+
+
+def test_manual_discrepancy_without_description_keeps_todays_id(
+    install_registry_and_publisher,
+):
+    """The id input for an absent description is the empty string, as it was
+    before episode keying, even though the stored description defaults to
+    "manual discrepancy". Changing it would re-key existing records."""
+    import uuid as uuid_mod
+
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, {
+        "eventId": "evt-1",
+        "manualDiscrepancy": {"severity": "MINOR"},
+    }))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert manual[0]["discrepancy_id"] == str(uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL, "manual|dis:1:1:4773|",
+    ))
+    assert manual[0]["description"] == "manual discrepancy"
+
+
+def test_manual_discrepancy_episode_survives_reanalysis(install_registry_and_publisher):
+    """The episode discrepancy survives a reanalysis with its sources
+    intact -- same guarantee as test_manual_discrepancy_survives_reanalysis,
+    extended to the new sources list."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert len(manual[0]["sources"]) == 1
+
+    ctx._now_ns += 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    manual_after = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual_after) == 1, "Episode discrepancy lost on subsequent reanalysis"
+    assert manual_after[0]["sources"] == manual[0]["sources"], (
+        "Sources lost on subsequent reanalysis"
+    )
+
+
+def test_decode_cm_event_preserves_manual_discrepancy_episode_fields(
+    install_registry_and_publisher,
+):
+    """The inbound cm-events path is protobuf BINARY
+    (`_decode_cm_event`), not a hand-built dict -- tests a-e bypass that
+    decode step entirely by calling apply_cm_event with a dict directly.
+    If gencode lacks ManualDiscrepancyRaised fields 4-6 (source, component,
+    fault_code), protoc still parses the binary payload successfully but
+    those fields are silently absent from the decoded dict -- no exception,
+    just data loss. This pins that the real wire path carries source,
+    component, fault_code and the envelope's recorded_by/event_id through
+    `_decode_cm_event`, not just the dict-shortcut path the other tests use."""
+    evt = cme.CmEvent()
+    evt.event_id = "evt-wire-1"
+    evt.recorded_by = "operator.atlantia"
+    evt.manual_discrepancy.description = "FCS computer BIT fault"
+    evt.manual_discrepancy.severity = "MAJOR"
+    evt.manual_discrepancy.source = "operator_report"
+    evt.manual_discrepancy.component = "fcs-computer"
+    evt.manual_discrepancy.fault_code = "F-1234"
+
+    decoded = _decode_cm_event(evt.SerializeToString())
+
+    assert decoded.get("recordedBy") == "operator.atlantia"
+    assert decoded.get("eventId") == "evt-wire-1"
+    md = decoded.get("manualDiscrepancy") or {}
+    assert md.get("source") == "operator_report"
+    assert md.get("component") == "fcs-computer"
+    assert md.get("faultCode") == "F-1234"

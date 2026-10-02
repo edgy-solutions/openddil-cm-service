@@ -63,6 +63,23 @@ class AdvisoryProvenanceRecord:
 
 
 @dataclass
+class DiscrepancySourceRecord:
+    """One report that contributed to an episode-keyed DiscrepancyRecord
+    (ADR-0018 §Amendment 2026-08-15).
+
+    THIS DATACLASS IS THE WIRE SHAPE, not the proto — see
+    AdvisoryProvenanceRecord's docstring above for why that matters here too.
+    `source` is an opaque string cm-service stores and never interprets; it
+    names no particular consumer or system.
+    """
+    source: str = ""
+    reported_by: str = ""
+    event_id: str = ""
+    reported_at_ns: int = 0
+    description: str = ""
+
+
+@dataclass
 class DiscrepancyRecord:
     discrepancy_id: str
     type: int                  # DiscrepancyType enum value
@@ -76,6 +93,16 @@ class DiscrepancyRecord:
     advisory_provenance: AdvisoryProvenanceRecord = field(
         default_factory=AdvisoryProvenanceRecord
     )
+    # Episode keying. component is a BOM slot_id; a non-empty fault_code
+    # groups every report of the same (asset, component, fault_code) into one
+    # discrepancy instead of one per report. Defaulted so durable state from
+    # before episode keying still decodes (empty fault_code == today's unkeyed manual
+    # discrepancy, unchanged).
+    component: str = ""
+    fault_code: str = ""
+    # Every report that contributed to this episode. Empty for the unkeyed
+    # (fault_code == "") path and for all earlier durable state.
+    sources: list[DiscrepancySourceRecord] = field(default_factory=list)
 
 
 @dataclass

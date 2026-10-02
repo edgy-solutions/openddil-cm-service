@@ -52,6 +52,7 @@ from as_maintained.persistence_model import (
     AdvisoryProvenanceRecord,
     AsMaintainedRecord,
     DiscrepancyRecord,
+    DiscrepancySourceRecord,
     InstalledCiRecord,
     ModComplianceRecord,
 )
@@ -429,21 +430,75 @@ def _apply_event_to_record(
             "MAJOR": disc.SEVERITY_MAJOR,
             "CRITICAL": disc.SEVERITY_CRITICAL,
         }.get(severity_str, disc.SEVERITY_MINOR)
+        description = md.get("description", "manual discrepancy")
+        recommended_action = md.get("recommendedAction") \
+            or md.get("recommended_action", "")
+        fault_code = md.get("faultCode") or md.get("fault_code") or ""
+
         # Manual discrepancies persist in a dedicated list so reanalysis
         # (which rebuilds `record.discrepancies` from baseline) does not
         # clobber human-raised findings. Merged into the wire form by
-        # store.record_to_proto.
+        # store.disc_record_to_proto.
+        if not fault_code:
+            # fault_code empty -> today's path, byte-identical. Same uuid5
+            # input and no sources entry (ADR-0018 §Amendment
+            # 2026-08-15).
+            record.manual_discrepancies.append(DiscrepancyRecord(
+                discrepancy_id=str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"manual|{record.asset_id}|{md.get('description', '')}",
+                )),
+                type=disc.DISCREPANCY_UNSPECIFIED,
+                description=description,
+                severity=severity,
+                recommended_action=recommended_action,
+                detected_at_ns=now_ns,
+            ))
+            return
+
+        # fault_code non-empty -> the episode path. Every report of the same
+        # (asset, component, fault_code) is one discrepancy with one source
+        # entry per contributing report, not one discrepancy per report.
+        component = md.get("component") or ""
+        discrepancy_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"episode|{record.asset_id}|{component}|{fault_code}",
+        ))
+        source_entry = DiscrepancySourceRecord(
+            source=md.get("source") or "",
+            reported_by=_get("recorded_by") or "",
+            event_id=_get("event_id") or "",
+            reported_at_ns=now_ns,
+            description=description,
+        )
+
+        existing = next(
+            (d for d in record.manual_discrepancies
+             if d.discrepancy_id == discrepancy_id),
+            None,
+        )
+        if existing is not None:
+            # A redelivery (same non-empty event_id already recorded) is a
+            # no-op: it must not double-count a source.
+            if source_entry.event_id and any(
+                s.event_id == source_entry.event_id for s in existing.sources
+            ):
+                return
+            existing.sources.append(source_entry)
+            existing.severity = max(existing.severity, severity)
+            # description and detected_at_ns stay those of the first report.
+            return
+
         record.manual_discrepancies.append(DiscrepancyRecord(
-            discrepancy_id=str(uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"manual|{record.asset_id}|{md.get('description', '')}",
-            )),
+            discrepancy_id=discrepancy_id,
             type=disc.DISCREPANCY_UNSPECIFIED,
-            description=md.get("description", "manual discrepancy"),
+            description=description,
             severity=severity,
-            recommended_action=md.get("recommendedAction")
-                or md.get("recommended_action", ""),
+            recommended_action=recommended_action,
             detected_at_ns=now_ns,
+            component=component,
+            fault_code=fault_code,
+            sources=[source_entry],
         ))
         return
 
@@ -859,11 +914,22 @@ def _disc_from_dict(x: dict) -> DiscrepancyRecord:
     """
     x = dict(x)
     adv = x.pop("advisory_provenance", None)
+    sources = x.pop("sources", None)
     rec = DiscrepancyRecord(**x)
     if isinstance(adv, dict):
         rec.advisory_provenance = AdvisoryProvenanceRecord(**adv)
     elif isinstance(adv, AdvisoryProvenanceRecord):
         rec.advisory_provenance = adv
+    if sources is not None:
+        # Same narrowing as advisory_provenance above, and for the same
+        # reason (ADR-0018 §Amendment 2026-08-15): `dataclasses.asdict`
+        # flattens each DiscrepancySourceRecord to a plain dict, so a bare
+        # `DiscrepancyRecord(**x)` would leave `sources` as a list of dicts.
+        rec.sources = [
+            s if isinstance(s, DiscrepancySourceRecord)
+            else DiscrepancySourceRecord(**s)
+            for s in sources
+        ]
     return rec
 
 

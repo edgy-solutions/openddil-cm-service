@@ -20,6 +20,7 @@ from .persistence_model import (
     AdvisoryProvenanceRecord,
     AsMaintainedRecord,
     DiscrepancyRecord,
+    DiscrepancySourceRecord,
     InstalledCiRecord,
     ModComplianceRecord,
 )
@@ -93,6 +94,19 @@ def _disc_proto_to_record(p: disc.ConfigurationDiscrepancy) -> DiscrepancyRecord
         related_mod_id=p.related_mod_id,
         detected_at_ns=_ts_to_ns(p.detected_at),
         advisory_provenance=_adv_proto_to_record(p.advisory_provenance),
+        component=p.component,
+        fault_code=p.fault_code,
+        sources=[_source_proto_to_record(s) for s in p.sources],
+    )
+
+
+def _source_proto_to_record(p: disc.DiscrepancySource) -> DiscrepancySourceRecord:
+    return DiscrepancySourceRecord(
+        source=p.source,
+        reported_by=p.reported_by,
+        event_id=p.event_id,
+        reported_at_ns=_ts_to_ns(p.reported_at),
+        description=p.description,
     )
 
 
@@ -177,7 +191,30 @@ def disc_record_to_proto(r: DiscrepancyRecord) -> disc.ConfigurationDiscrepancy:
     # also the honest encoding: no claim, rather than an empty claim.
     if not _adv_is_default(r.advisory_provenance):
         _adv_record_to_proto_into(r.advisory_provenance, p.advisory_provenance)
+    p.component = r.component
+    p.fault_code = r.fault_code
+    for s in r.sources:
+        _source_record_to_proto_into(s, p.sources.add())
     return p
+
+
+def _source_record_to_proto_into(r: DiscrepancySourceRecord | dict,
+                                   p: disc.DiscrepancySource) -> None:
+    """Fill a DiscrepancySource submessage in place.
+
+    Tolerates a raw dict the same way `_adv_record_to_proto_into` does:
+    durable state decoded via `_disc_from_dict` always narrows to
+    DiscrepancySourceRecord, but a caller holding a hand-built record may
+    pass either.
+    """
+    if isinstance(r, dict):
+        r = DiscrepancySourceRecord(**r)
+    p.source = r.source
+    p.reported_by = r.reported_by
+    p.event_id = r.event_id
+    if r.reported_at_ns:
+        p.reported_at.CopyFrom(_ns_to_ts(r.reported_at_ns))
+    p.description = r.description
 
 
 def _adv_is_default(r: AdvisoryProvenanceRecord | dict | None) -> bool:
