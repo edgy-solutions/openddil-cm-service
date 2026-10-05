@@ -870,3 +870,180 @@ def test_decode_cm_event_preserves_manual_discrepancy_episode_fields(
     assert md.get("source") == "operator_report"
     assert md.get("component") == "fcs-computer"
     assert md.get("faultCode") == "F-1234"
+
+
+# ---------------------------------------------------------------------------
+# No-fault-code reports keep their component. ADR-0018 §Amendment
+# 2026-08-15 (additive-only) and its amendment 2026-10-05: a report with no
+# fault code keeps its component; only a report with neither code nor
+# component keeps the legacy path.
+# ---------------------------------------------------------------------------
+
+def test_manual_discrepancy_no_fault_code_with_component_uses_episode_path(
+    install_registry_and_publisher,
+):
+    """No fault_code but a component -> the episode path, not legacy: one
+    discrepancy keyed on (asset, component, ""), component preserved,
+    fault_code "", and one source entry for the report."""
+    import uuid as uuid_mod
+
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    entry = manual[0]
+    assert entry["component"] == "cooling_fan"
+    assert entry["fault_code"] == ""
+    expected_id = str(uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL, "episode|dis:1:1:4773|cooling_fan|",
+    ))
+    assert entry["discrepancy_id"] == expected_id
+    sources = entry["sources"]
+    assert len(sources) == 1
+    assert sources[0]["source"] == "operator_report"
+    assert sources[0]["event_id"] == "evt-1"
+
+
+def test_manual_discrepancy_no_fault_code_merges_sources_not_duplicates(
+    install_registry_and_publisher,
+):
+    """Two no-code reports on the same component, different event_ids and
+    descriptions -> 1 discrepancy, 2 sources, description of the first
+    report (merge rules match the coded episode path)."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="",
+        description="Cooling fan is making noise",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-2", recorded_by="telemetry-ingest",
+        source="telemetry_bit", component="cooling_fan", fault_code="",
+        description="Cooling fan vibration detected",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    entry = manual[0]
+    assert len(entry["sources"]) == 2
+    assert entry["description"] == "Cooling fan is making noise"
+
+
+def test_manual_discrepancy_no_fault_code_redelivery_is_a_no_op(
+    install_registry_and_publisher,
+):
+    """Redelivery of the same event_id for a no-code report -> still 1
+    source, not 2."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    payload = _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="",
+    )
+    asyncio.run(apply_cm_event(ctx, dict(payload)))
+    asyncio.run(apply_cm_event(ctx, dict(payload)))  # redelivery
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert len(manual[0]["sources"]) == 1
+
+
+def test_manual_discrepancy_no_fault_code_different_components_are_separate(
+    install_registry_and_publisher,
+):
+    """No fault_code, different components -> 2 discrepancies; the
+    component, not just the asset, keys the episode when there is no fault
+    code."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-2", recorded_by="operator.atlantia",
+        source="operator_report", component="hydraulic_pump", fault_code="",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 2
+    components = {d["component"] for d in manual}
+    assert components == {"cooling_fan", "hydraulic_pump"}, (
+        "components must be preserved on the episode path, not dropped to "
+        "the legacy empty string"
+    )
+
+
+def test_manual_discrepancy_no_fault_code_no_component_keeps_legacy_path(
+    install_registry_and_publisher,
+):
+    """Regression: no fault_code AND no component is the only case that
+    still takes the legacy path -- id uuid5("manual|<asset>|<description>"),
+    component "", sources []. This may already pass; it pins that the
+    legacy path still exists once the no-code+component case is routed
+    through the episode path above."""
+    import uuid as uuid_mod
+
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    description = "Visual: hatch hinge cracked"
+    asyncio.run(apply_cm_event(ctx, {
+        "eventId": "evt-1",
+        "recordedBy": "operator.atlantia",
+        "manualDiscrepancy": {
+            "description": description,
+            "severity": "MAJOR",
+            "recommendedAction": "Replace hatch assembly",
+        },
+    }))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    entry = manual[0]
+    expected_id = str(uuid_mod.uuid5(
+        uuid_mod.NAMESPACE_URL,
+        f"manual|dis:1:1:4773|{description}",
+    ))
+    assert entry["discrepancy_id"] == expected_id
+    assert entry["component"] == ""
+    assert entry["sources"] == []
+
+
+def test_manual_discrepancy_coded_and_no_code_same_component_are_separate(
+    install_registry_and_publisher,
+):
+    """A coded report and a no-code report on the same component -> 2
+    discrepancies with different ids: fault_code is still part of the
+    episode key, so "" and a real code never collide."""
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-1", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="F-9999",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="evt-2", recorded_by="operator.atlantia",
+        source="operator_report", component="cooling_fan", fault_code="",
+    )))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 2
+    ids = {d["discrepancy_id"] for d in manual}
+    assert len(ids) == 2
+    no_code_entry = next(d for d in manual if d["fault_code"] == "")
+    assert no_code_entry["component"] == "cooling_fan", (
+        "the no-code report must keep its component, not fall back to the "
+        "legacy path's empty component"
+    )

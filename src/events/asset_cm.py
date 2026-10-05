@@ -439,10 +439,15 @@ def _apply_event_to_record(
         # (which rebuilds `record.discrepancies` from baseline) does not
         # clobber human-raised findings. Merged into the wire form by
         # store.disc_record_to_proto.
-        if not fault_code:
-            # fault_code empty -> today's path, byte-identical. Same uuid5
-            # input and no sources entry (ADR-0018 §Amendment
-            # 2026-08-15).
+        component = md.get("component") or ""
+
+        if not fault_code and not component:
+            # fault_code empty AND component empty -> today's legacy path,
+            # byte-identical. Same uuid5 input and no sources entry
+            # (ADR-0018 §Amendment 2026-08-15 (additive-only) and its
+            # amendment 2026-10-05: a report with no fault code keeps its
+            # component; only a report with neither code nor component
+            # keeps the legacy path).
             record.manual_discrepancies.append(DiscrepancyRecord(
                 discrepancy_id=str(uuid.uuid5(
                     uuid.NAMESPACE_URL,
@@ -456,10 +461,14 @@ def _apply_event_to_record(
             ))
             return
 
-        # fault_code non-empty -> the episode path. Every report of the same
-        # (asset, component, fault_code) is one discrepancy with one source
-        # entry per contributing report, not one discrepancy per report.
-        component = md.get("component") or ""
+        # Either fault_code is non-empty, or fault_code is empty but a
+        # component was given -> the shared episode path. Every report of
+        # the same (asset, component, fault_code) is one discrepancy with
+        # one source entry per contributing report, not one discrepancy per
+        # report. When fault_code is empty this still keys on the
+        # component alone (fault_code contributes the empty string to the
+        # id), which is exactly what keeps a no-code report tied to the
+        # component the maintainer picked.
         discrepancy_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"episode|{record.asset_id}|{component}|{fault_code}",
