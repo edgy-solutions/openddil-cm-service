@@ -18,9 +18,12 @@ import json
 import asyncpg
 
 
-async def read_manual_discrepancies(dsn: str, asset_id: str) -> list[dict] | None:
+async def read_manual_discrepancies(
+    dsn: str | None, asset_id: str,
+) -> list[dict] | None:
     """Return the stored manual discrepancies, or None when there is no row.
 
+    `dsn` None means the standard PG* environment (asyncpg reads it).
     Errors propagate: the caller must not treat an unreachable store as an
     empty one.
     """

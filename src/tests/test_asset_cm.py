@@ -1172,6 +1172,7 @@ def test_no_dsn_never_calls_the_store(
     install_registry_and_publisher, monkeypatch,
 ):
     asset_cm.set_store_dsn(None)
+    monkeypatch.delenv("PGHOST", raising=False)
 
     async def sentinel(dsn, asset_id):
         raise AssertionError("store must not be called without a DSN")
@@ -1180,6 +1181,40 @@ def test_no_dsn_never_calls_the_store(
     ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
     asyncio.run(observe(ctx, _silver_event_dict()))
     assert ctx._state["am_state"]["manual_discrepancies"] == []
+
+
+def test_pghost_only_restores_with_dsn_none(
+    install_registry_and_publisher, monkeypatch,
+):
+    asset_cm.set_store_dsn(None)
+    monkeypatch.setenv("PGHOST", "store.invalid")
+    calls = _patch_store(monkeypatch, [_stored_episode()])
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert calls == [(None, "dis:1:1:4773")]
+    assert len(ctx._state["am_state"]["manual_discrepancies"]) == 1
+
+
+def test_neither_set_is_not_configured(monkeypatch):
+    asset_cm.set_store_dsn(None)
+    monkeypatch.delenv("PGHOST", raising=False)
+    assert asset_cm.store_configured() is False
+    monkeypatch.setenv("PGHOST", "store.invalid")
+    assert asset_cm.store_configured() is True
+
+
+def test_store_read_passes_none_dsn_through(monkeypatch):
+    from as_maintained import store_read
+    seen = []
+
+    async def fake_connect(*args, **kw):
+        seen.append((args, kw))
+        return _FakeConn(row=None)
+
+    monkeypatch.setattr(store_read.asyncpg, "connect", fake_connect)
+    asyncio.run(store_read.read_manual_discrepancies(None, "a1"))
+    assert seen[0][0] == (None,)
+    assert seen[0][1]["server_settings"] == {"default_transaction_read_only": "on"}
 
 
 def test_registered_branch_does_not_call_the_store(

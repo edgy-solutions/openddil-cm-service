@@ -95,10 +95,18 @@ def _install_kafka_publisher(producer: Producer) -> None:
 def _install_store_dsn() -> None:
     dsn = os.getenv("CM_STORE_DSN", "")
     asset_cm.set_store_dsn(dsn)
-    if not dsn:
+    if dsn:
+        logger.info("store connection: CM_STORE_DSN (compose fallback)")
+    elif asset_cm.store_configured():
+        logger.info(
+            "store connection: PG* environment (host=%s db=%s user=%s)",
+            os.getenv("PGHOST", ""), os.getenv("PGDATABASE", ""),
+            os.getenv("PGUSER", ""),
+        )
+    else:
         logger.warning(
-            "CM_STORE_DSN unset: open faults are re-opened as new episodes "
-            "after a Restate state wipe"
+            "store connection unset (no PGHOST, no CM_STORE_DSN): open "
+            "faults are re-opened as new episodes after a Restate state wipe"
         )
 
 

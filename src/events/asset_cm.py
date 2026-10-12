@@ -97,10 +97,17 @@ _store_dsn: str | None = None
 
 
 def set_store_dsn(dsn: str | None) -> None:
-    """Configure the tier store DSN used to restore manual discrepancies.
-    None or empty means not configured."""
+    """Configure the compose-fallback DSN used to restore manual
+    discrepancies. None or empty means no DSN; the store may still be
+    configured through the standard PG* environment (see store_configured)."""
     global _store_dsn
     _store_dsn = dsn or None
+
+
+def store_configured() -> bool:
+    """The tier store is configured when a DSN is set (compose fallback) or
+    the standard PG* environment names a host (PGHOST non-empty)."""
+    return bool(_store_dsn) or bool(os.getenv("PGHOST", ""))
 
 
 def set_baseline_registry(reg: BaselineRegistry) -> None:
@@ -347,8 +354,10 @@ async def _load_or_init(
     proto.lifecycle = am.LIFECYCLE_ACTIVE
     proto.last_observed_at.FromNanoseconds(now_ns)
     record = proto_to_record(proto)
-    dsn = _store_dsn
-    if dsn:
+    if store_configured():
+        # dsn is None when the PG* environment is the source: asyncpg then
+        # reads PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD/PGSSLMODE itself.
+        dsn = _store_dsn
         # Restate state is empty (first seen, or wiped by an upgrade): the
         # tier store still holds this asset's open faults. A store error
         # raises, so Restate retries rather than minting a new episode.
