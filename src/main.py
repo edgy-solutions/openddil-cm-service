@@ -92,6 +92,16 @@ def _install_kafka_publisher(producer: Producer) -> None:
     logger.info("Kafka publisher installed on AssetCM handlers")
 
 
+def _install_store_dsn() -> None:
+    dsn = os.getenv("CM_STORE_DSN", "")
+    asset_cm.set_store_dsn(dsn)
+    if not dsn:
+        logger.warning(
+            "CM_STORE_DSN unset: open faults are re-opened as new episodes "
+            "after a Restate state wipe"
+        )
+
+
 def _install_baselines() -> None:
     # CM_BASELINES_DIRS (multi) takes precedence over CM_BASELINES_DIR
     # (single, back-compat default). When neither is set, fall back to
@@ -167,6 +177,7 @@ def main() -> None:
     _configure_logging()
     _start_metrics_server()
     _install_baselines()
+    _install_store_dsn()
     producer = _build_producer()
     _install_kafka_publisher(producer)
     asyncio.run(_run_server(producer))

@@ -19,6 +19,8 @@ dependencies = [
     "cloudevents>=1.10.0,<2.0.0",
     "pyyaml>=6.0",
     "prometheus-client>=0.20.0,<1.0.0",
+    # Read-only store read for restoring custody records after a state wipe.
+    "asyncpg>=0.29.0,<1.0.0",
 ]
 
 [project.optional-dependencies]

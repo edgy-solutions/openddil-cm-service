@@ -56,6 +56,7 @@ from as_maintained.persistence_model import (
     InstalledCiRecord,
     ModComplianceRecord,
 )
+from as_maintained.store_read import read_manual_discrepancies
 from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
 from discrepancy.analyzer import (
@@ -90,6 +91,16 @@ _KEY_NEXT_RECHECK = "next_recheck_ns"
 # Module-level baseline registry — initialized by main.py on app startup and
 # referenced from handlers. Tests inject their own via set_baseline_registry().
 _baseline_registry: BaselineRegistry | None = None
+
+
+_store_dsn: str | None = None
+
+
+def set_store_dsn(dsn: str | None) -> None:
+    """Configure the tier store DSN used to restore manual discrepancies.
+    None or empty means not configured."""
+    global _store_dsn
+    _store_dsn = dsn or None
 
 
 def set_baseline_registry(reg: BaselineRegistry) -> None:
@@ -294,6 +305,8 @@ async def _load_or_init(
     # row carries real edge attribution from the start.
     edge_id, region_id = _extract_origin(silver_event)
 
+    # The two REGISTERED branches below restore nothing: a REGISTERED asset
+    # has no episodes to keep.
     if not variant or variant == "UNKNOWN":
         logger.warning(
             "Asset %s first seen with platform_variant=%r — registering "
@@ -334,6 +347,24 @@ async def _load_or_init(
     proto.lifecycle = am.LIFECYCLE_ACTIVE
     proto.last_observed_at.FromNanoseconds(now_ns)
     record = proto_to_record(proto)
+    dsn = _store_dsn
+    if dsn:
+        # Restate state is empty (first seen, or wiped by an upgrade): the
+        # tier store still holds this asset's open faults. A store error
+        # raises, so Restate retries rather than minting a new episode.
+        async def _restore() -> list[dict] | None:
+            return await read_manual_discrepancies(dsn, asset_id)
+
+        stored_manual = await ctx.run("restore-manual-discrepancies", _restore)
+        if stored_manual:
+            record.manual_discrepancies = [
+                _disc_from_restored(x) for x in stored_manual
+            ]
+            logger.info(
+                "Asset %s restored %d manual discrepancy(ies) from the store "
+                "(first-observed times kept)",
+                asset_id, len(record.manual_discrepancies),
+            )
     logger.info(
         "Asset %s initialized against baseline %s (variant=%s)",
         asset_id, baseline.baseline_id, variant,
@@ -940,6 +971,28 @@ def _disc_from_dict(x: dict) -> DiscrepancyRecord:
             for s in sources
         ]
     return rec
+
+
+def _disc_from_restored(x: dict) -> DiscrepancyRecord:
+    """Build a DiscrepancyRecord from a stored (store-sourced) dict.
+
+    Keys that are not dataclass fields are dropped, and the nanosecond
+    fields are coerced to int. An entry that still cannot be built raises.
+    """
+    disc_fields = {f.name for f in dataclasses.fields(DiscrepancyRecord)}
+    src_fields = {f.name for f in dataclasses.fields(DiscrepancySourceRecord)}
+    x = {k: v for k, v in x.items() if k in disc_fields}
+    if "detected_at_ns" in x:
+        x["detected_at_ns"] = int(x["detected_at_ns"])
+    if x.get("sources") is not None:
+        srcs = []
+        for s in x["sources"]:
+            s = {k: v for k, v in s.items() if k in src_fields}
+            if "reported_at_ns" in s:
+                s["reported_at_ns"] = int(s["reported_at_ns"])
+            srcs.append(s)
+        x["sources"] = srcs
+    return _disc_from_dict(x)
 
 
 def _dict_to_record(d: dict) -> AsMaintainedRecord:

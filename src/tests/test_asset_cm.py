@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -97,6 +99,8 @@ class StubCtx:
             result = self._now_ns
         else:
             result = fn()
+            if inspect.isawaitable(result):
+                result = await result
         self.runs.append((label, result))
         return result
 
@@ -1047,3 +1051,212 @@ def test_manual_discrepancy_coded_and_no_code_same_component_are_separate(
         "the no-code report must keep its component, not fall back to the "
         "legacy path's empty component"
     )
+
+
+# ---------------------------------------------------------------------------
+# Restoring open faults from the tier store after a Restate state wipe.
+# ---------------------------------------------------------------------------
+
+_FAKE_DSN = "postgresql://user:fake@store.invalid:5432/db"
+
+
+@pytest.fixture
+def store_dsn():
+    asset_cm.set_store_dsn(_FAKE_DSN)
+    yield
+    asset_cm.set_store_dsn(None)
+
+
+def _stored_episode(event_id: str = "E", detected_at_ns: int = 111) -> dict:
+    return {
+        "discrepancy_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL, "episode|dis:1:1:4773|fcs-computer|F-1234",
+        )),
+        "type": 0,
+        "description": "FCS computer BIT fault",
+        "severity": 2,
+        "recommended_action": "Swap FCS computer",
+        "detected_at_ns": detected_at_ns,
+        "component": "fcs-computer",
+        "fault_code": "F-1234",
+        "sources": [{
+            "source": "operator_report", "reported_by": "operator.atlantia",
+            "event_id": event_id, "reported_at_ns": 111,
+            "description": "FCS computer BIT fault",
+        }],
+    }
+
+
+def _patch_store(monkeypatch, result):
+    calls: list[tuple[str, str]] = []
+
+    async def fake(dsn, asset_id):
+        calls.append((dsn, asset_id))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(asset_cm, "read_manual_discrepancies", fake)
+    return calls
+
+
+def _report(event_id: str) -> dict:
+    return _episode_cm_event(
+        event_id=event_id, recorded_by="operator.atlantia",
+        source="operator_report",
+    )
+
+
+def _emitted_manual(published):
+    payloads = [json.loads(v) for t, _, v in published if t == "asset-cm-state"]
+    return payloads[-1]["manual_discrepancies"]
+
+
+def test_restore_after_wipe_same_report_keeps_first_observed(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_store(monkeypatch, [_stored_episode("E")])
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    ctx._now_ns = _now_ns("2026-05-12T13:00:00Z")
+    asyncio.run(apply_cm_event(ctx, _report("E")))
+
+    for manual in (ctx._state["am_state"]["manual_discrepancies"],
+                   _emitted_manual(install_registry_and_publisher)):
+        assert len(manual) == 1
+        assert manual[0]["detected_at_ns"] == 111
+        assert len(manual[0]["sources"]) == 1
+
+
+def test_restore_after_wipe_new_report_appends_source_keeps_time(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_store(monkeypatch, [_stored_episode("E")])
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    ctx._now_ns = _now_ns("2026-05-12T13:00:00Z")
+    asyncio.run(apply_cm_event(ctx, _report("E2")))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert manual[0]["detected_at_ns"] == 111
+    assert len(manual[0]["sources"]) == 2
+
+
+@pytest.mark.parametrize("stored", [None, []])
+def test_reset_no_stored_episode_opens_new_episode(
+    install_registry_and_publisher, store_dsn, monkeypatch, stored,
+):
+    _patch_store(monkeypatch, stored)
+    now = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=now)
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _report("E")))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert manual[0]["detected_at_ns"] == now
+
+
+def test_store_error_raises_and_leaves_no_state(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_store(monkeypatch, ConnectionError("store down"))
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    with pytest.raises(ConnectionError):
+        asyncio.run(observe(ctx, _silver_event_dict()))
+    assert "am_state" not in ctx._state
+
+
+def test_no_dsn_never_calls_the_store(
+    install_registry_and_publisher, monkeypatch,
+):
+    asset_cm.set_store_dsn(None)
+
+    async def sentinel(dsn, asset_id):
+        raise AssertionError("store must not be called without a DSN")
+
+    monkeypatch.setattr(asset_cm, "read_manual_discrepancies", sentinel)
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert ctx._state["am_state"]["manual_discrepancies"] == []
+
+
+def test_registered_branch_does_not_call_the_store(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    calls = _patch_store(monkeypatch, [_stored_episode()])
+    ctx = StubCtx(key="dis:9:9:9999", now_ns=_now_ns())
+    event = _silver_event_dict(asset_id="dis:9:9:9999", platform_variant="UNKNOWN")
+    asyncio.run(observe(ctx, event))
+    assert calls == []
+    assert ctx._state["am_state"]["lifecycle"] == am.LIFECYCLE_REGISTERED
+
+
+def test_disc_from_restored_drops_unknown_keys_and_coerces_ints():
+    x = _stored_episode()
+    x["detected_at_ns"] = "111"
+    x["not_a_field"] = "dropped"
+    x["sources"][0]["reported_at_ns"] = "222"
+    x["sources"][0]["not_a_source_field"] = "dropped"
+    rec = asset_cm._disc_from_restored(x)
+    assert rec.detected_at_ns == 111 and isinstance(rec.detected_at_ns, int)
+    assert rec.sources[0].reported_at_ns == 222
+    assert not hasattr(rec, "not_a_field")
+    assert not hasattr(rec.sources[0], "not_a_source_field")
+
+
+# store_read.read_manual_discrepancies, against a fake connection.
+
+class _FakeConn:
+    def __init__(self, row=None, error=None):
+        self.row, self.error, self.closed = row, error, False
+
+    async def fetchrow(self, query, *args):
+        if self.error:
+            raise self.error
+        return self.row
+
+    async def close(self):
+        self.closed = True
+
+
+def _read(monkeypatch, conn):
+    from as_maintained import store_read
+    seen = {}
+
+    async def fake_connect(dsn, **kw):
+        seen.update(kw)
+        return conn
+
+    monkeypatch.setattr(store_read.asyncpg, "connect", fake_connect)
+    result = asyncio.run(store_read.read_manual_discrepancies(_FAKE_DSN, "a1"))
+    return result, seen
+
+
+def test_store_read_row_absent_is_none(monkeypatch):
+    conn = _FakeConn(row=None)
+    result, seen = _read(monkeypatch, conn)
+    assert result is None
+    assert seen["server_settings"] == {"default_transaction_read_only": "on"}
+    assert conn.closed
+
+
+def test_store_read_decodes_jsonb_text(monkeypatch):
+    conn = _FakeConn(row={"manual_discrepancies": json.dumps([{"a": 1}])})
+    result, _ = _read(monkeypatch, conn)
+    assert result == [{"a": 1}]
+    assert conn.closed
+
+
+def test_store_read_sql_null_is_empty_list(monkeypatch):
+    conn = _FakeConn(row={"manual_discrepancies": None})
+    result, _ = _read(monkeypatch, conn)
+    assert result == []
+
+
+def test_store_read_closes_connection_on_error(monkeypatch):
+    conn = _FakeConn(error=RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        _read(monkeypatch, conn)
+    assert conn.closed
