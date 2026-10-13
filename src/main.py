@@ -20,25 +20,37 @@ Environment:
   CM_STALENESS_WINDOW_S   staleness threshold in seconds (default: 900)
   CM_RECHECK_MIN_DELAY_S  minimum delay between rechecks (default: 30)
   LOG_LEVEL               INFO / DEBUG / WARN (default: INFO)
-  METRICS_PORT            Prometheus /metrics HTTP port (default: 9464)
+  METRICS_PORT            HTTP port (default: 9464) serving Prometheus /metrics
+                          and /healthz/live (503 when the producer has
+                          attempted to publish but confirmed no delivery
+                          within CM_PRODUCER_STALL_S; wire it to the
+                          container's livenessProbe)
+  CM_PRODUCER_STALL_S     window in seconds for the producer stall check
+                          (default: 180)
+  CM_PRODUCER_GRACE_S     seconds after start before the stall check may
+                          report stalled (default: 120)
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
+import threading
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-import prometheus_client
 from confluent_kafka import Producer, KafkaException
+from prometheus_client.exposition import MetricsHandler
 
 # Generated proto bindings are on PYTHONPATH (set by Dockerfile)
 sys.path.insert(0, str(Path(__file__).parent))
 
 from baselines.loader import make_registry, parse_dirs_env
 from events import asset_cm
+import producer_health
 
 logger = logging.getLogger("cm_service.main")
 
@@ -50,6 +62,20 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
+
+
+def _error_cb(err) -> None:  # noqa: ANN001
+    if producer_health.die_if_fatal(err, "error_cb"):
+        return
+    logger.warning("Kafka client error: %s", err)
+
+
+def _on_delivery(err, _msg) -> None:  # noqa: ANN001
+    if err is not None:
+        if not producer_health.die_if_fatal(err, "delivery callback"):
+            logger.warning("Kafka delivery failed: %s", err)
+        return
+    producer_health.note_delivered()
 
 
 def _build_producer() -> Producer:
@@ -66,6 +92,7 @@ def _build_producer() -> Producer:
                                       # broker-side mitigation of THIS line;
                                       # keep both, but this is the real fix.
         "enable.idempotence": True,
+        "error_cb":           _error_cb,
     }
     producer = Producer(conf)
     # Probe connectivity but don't crash on transient failures.
@@ -80,15 +107,40 @@ def _build_producer() -> Producer:
     return producer
 
 
+_poll_stop = threading.Event()
+
+
+def _poll_loop(producer: Producer) -> None:
+    # Serves delivery callbacks between publishes. Without it a callback
+    # waits for the next publish, and a quiet period after one produce would
+    # read as "produced, not delivered" on a healthy pod.
+    while not _poll_stop.is_set():
+        try:
+            producer.poll(0.5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("producer poll failed: %s", exc)
+            _poll_stop.wait(0.5)
+
+
 def _install_kafka_publisher(producer: Producer) -> None:
     def publish(topic: str, key: str, value: bytes) -> None:
-        producer.produce(
-            topic=topic,
-            key=(key or "").encode("utf-8") if isinstance(key, str) else key,
-            value=value,
-        )
+        producer_health.note_produce()
+        try:
+            producer.produce(
+                topic=topic,
+                key=(key or "").encode("utf-8") if isinstance(key, str) else key,
+                value=value,
+                on_delivery=_on_delivery,
+            )
+        except KafkaException as exc:
+            if exc.args:
+                producer_health.die_if_fatal(exc.args[0], "produce")
+            raise
         producer.poll(0)  # service delivery callbacks
     asset_cm.set_kafka_publisher(publish)
+    _poll_stop.clear()
+    threading.Thread(target=_poll_loop, args=(producer,), daemon=True,
+                     name="producer-poll").start()
     logger.info("Kafka publisher installed on AssetCM handlers")
 
 
@@ -163,6 +215,7 @@ async def _run_server(producer: Producer) -> None:
     try:
         await server_task
     finally:
+        _poll_stop.set()
         logger.info("Flushing Kafka producer (timeout=10 s)...")
         remaining = producer.flush(timeout=10)
         if remaining > 0:
@@ -170,15 +223,41 @@ async def _run_server(producer: Producer) -> None:
                             remaining)
 
 
-def _start_metrics_server() -> None:
-    port = int(os.environ.get("METRICS_PORT", "9464"))
+class _HealthHandler(MetricsHandler):
+    """/metrics (unchanged) plus /healthz/live on the same port."""
+
+    def do_GET(self):  # noqa: N802
+        if self.path.startswith("/healthz/live"):
+            st = producer_health.state()
+            body = json.dumps(st).encode()
+            # 503 is what makes the kubelet restart the container.
+            self.send_response(503 if st["stalled"] else 200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+    def log_message(self, *_a):  # noqa: ANN002
+        pass  # probes arrive every few seconds; do not narrate them
+
+
+def _start_metrics_server(port: int | None = None) -> ThreadingHTTPServer | None:
+    if port is None:
+        port = int(os.environ.get("METRICS_PORT", "9464"))
     try:
-        prometheus_client.start_http_server(port)
-        logger.info("Prometheus metrics server listening on :%d", port)
+        srv = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     except OSError as exc:
         # Non-fatal: a taken port (e.g. a second local instance during dev)
         # should not stop the service from serving its actual traffic.
         logger.warning("Could not start metrics server on :%d: %s", port, exc)
+        return None
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="metrics-health").start()
+    logger.info("Metrics/health server listening on :%d", srv.server_address[1])
+    return srv
 
 
 def main() -> None:
