@@ -14,8 +14,11 @@ is found here and a fault opens a new episode, as intended.
 from __future__ import annotations
 
 import json
+import logging
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 async def read_manual_discrepancies(
@@ -43,3 +46,29 @@ async def read_manual_discrepancies(
     if isinstance(value, (str, bytes)):
         value = json.loads(value)
     return value if isinstance(value, list) else []
+
+
+async def read_declared_baseline(dsn: str | None, asset_id: str) -> str | None:
+    """Return the baseline id the asset's declaration names, or None.
+
+    None covers no declaration row, an empty baseline id, and a store older
+    than the declaration schema (the table is absent). `dsn` None means the
+    standard PG* environment. Any other error propagates: the caller must not
+    treat an unreachable store as "no declaration".
+    """
+    conn = await asyncpg.connect(
+        dsn, server_settings={"default_transaction_read_only": "on"}, timeout=5,
+    )
+    try:
+        row = await conn.fetchrow(
+            "SELECT baseline_id FROM asset_declaration WHERE asset_id = $1",
+            asset_id,
+        )
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.warning("asset_declaration table is absent; no declared baselines")
+        return None
+    finally:
+        await conn.close()
+    if row is None:
+        return None
+    return row["baseline_id"] or None

@@ -1060,6 +1060,15 @@ def test_manual_discrepancy_coded_and_no_code_same_component_are_separate(
 _FAKE_DSN = "postgresql://user:fake@store.invalid:5432/db"
 
 
+@pytest.fixture(autouse=True)
+def no_declaration_by_default(monkeypatch):
+    """No test reaches a real store; declaration tests override this."""
+    async def none(dsn, asset_id):
+        return None
+
+    monkeypatch.setattr(asset_cm, "read_declared_baseline", none, raising=False)
+
+
 @pytest.fixture
 def store_dsn():
     asset_cm.set_store_dsn(_FAKE_DSN)
@@ -1294,4 +1303,170 @@ def test_store_read_closes_connection_on_error(monkeypatch):
     conn = _FakeConn(error=RuntimeError("boom"))
     with pytest.raises(RuntimeError):
         _read(monkeypatch, conn)
+    assert conn.closed
+
+
+# ---------------------------------------------------------------------------
+# Declared baseline on the first-seen path
+# ---------------------------------------------------------------------------
+
+_VAR_V, _ID_Y = "M1A2-SEPv3", "M1A2-SEPv3-Baseline-2024.2"
+_VAR_W, _ID_X = "UH-60M", "UH-60M-Baseline-2024.1"
+
+
+def _patch_declared(monkeypatch, result):
+    calls: list[tuple[str | None, str]] = []
+
+    async def fake(dsn, asset_id):
+        calls.append((dsn, asset_id))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    # raising=False: the attribute does not exist before the change
+    monkeypatch.setattr(asset_cm, "read_declared_baseline", fake, raising=False)
+
+    async def no_manual(dsn, asset_id):
+        return None
+
+    monkeypatch.setattr(asset_cm, "read_manual_discrepancies", no_manual)
+    return calls
+
+
+def _first_seen(variant, key="dis:1:1:4773"):
+    ctx = StubCtx(key=key, now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict(asset_id=key, platform_variant=variant)))
+    return ctx
+
+
+def test_declared_baseline_overrides_variant_default(
+    install_registry_and_publisher, store_dsn, monkeypatch, caplog,
+):
+    calls = _patch_declared(monkeypatch, _ID_X)
+    with caplog.at_level("INFO", logger=asset_cm.logger.name):
+        ctx = _first_seen(_VAR_V)
+    rec = ctx._state["am_state"]
+    assert rec["baseline_id"] == _ID_X
+    assert rec["lifecycle"] == am.LIFECYCLE_ACTIVE
+    assert calls == [(_FAKE_DSN, "dis:1:1:4773")]
+    assert ("read-declared-baseline", _ID_X) in ctx.runs
+    text = caplog.text
+    assert (f"initialized against declared baseline {_ID_X} "
+            f"(declaration; variant={_VAR_V})") in text
+    assert (f"declared baseline {_ID_X} differs from the variant "
+            f"'{_VAR_V}' default {_ID_Y}; using the declaration") in text
+
+
+def test_declared_baseline_rescues_unknown_variant(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_declared(monkeypatch, _ID_X)
+    ctx = _first_seen("UNKNOWN")
+    rec = ctx._state["am_state"]
+    assert rec["baseline_id"] == _ID_X
+    assert rec["lifecycle"] == am.LIFECYCLE_ACTIVE
+
+
+def test_declared_baseline_not_loaded_uses_variant_default(
+    install_registry_and_publisher, store_dsn, monkeypatch, caplog,
+):
+    _patch_declared(monkeypatch, "no-such-baseline")
+    with caplog.at_level("INFO", logger=asset_cm.logger.name):
+        ctx = _first_seen(_VAR_V)
+    assert ctx._state["am_state"]["baseline_id"] == _ID_Y
+    assert ("declared baseline no-such-baseline is not loaded; "
+            "using the variant default") in caplog.text
+
+
+def test_no_declaration_uses_variant_default(
+    install_registry_and_publisher, store_dsn, monkeypatch, caplog,
+):
+    _patch_declared(monkeypatch, None)
+    with caplog.at_level("INFO", logger=asset_cm.logger.name):
+        ctx = _first_seen(_VAR_V)
+    assert ctx._state["am_state"]["baseline_id"] == _ID_Y
+    assert (f"initialized against baseline {_ID_Y} (variant={_VAR_V})"
+            in caplog.text)
+    assert "declared baseline" not in caplog.text
+
+
+def test_declared_baseline_not_read_without_store(
+    install_registry_and_publisher, monkeypatch,
+):
+    asset_cm.set_store_dsn(None)
+    monkeypatch.delenv("PGHOST", raising=False)
+    calls = _patch_declared(monkeypatch, _ID_X)
+    ctx = _first_seen(_VAR_V)
+    assert calls == []
+    assert ctx._state["am_state"]["baseline_id"] == _ID_Y
+
+
+def test_declared_baseline_store_error_raises_and_leaves_no_state(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_declared(monkeypatch, OSError("store down"))
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    with pytest.raises(OSError):
+        asyncio.run(observe(ctx, _silver_event_dict()))
+    assert "am_state" not in ctx._state
+
+
+# store_read.read_declared_baseline, against a recording fake connection.
+
+class _RecConn(_FakeConn):
+    def __init__(self, row=None, error=None):
+        super().__init__(row=row, error=error)
+        self.queries: list[tuple[str, tuple]] = []
+
+    async def fetchrow(self, query, *args):
+        self.queries.append((query, args))
+        return await super().fetchrow(query, *args)
+
+
+def _read_decl(monkeypatch, conn):
+    from as_maintained import store_read
+
+    async def fake_connect(dsn, **kw):
+        return conn
+
+    monkeypatch.setattr(store_read.asyncpg, "connect", fake_connect)
+    return asyncio.run(store_read.read_declared_baseline(_FAKE_DSN, "a1"))
+
+
+def test_read_declared_baseline_returns_id_and_keys_on_asset(monkeypatch):
+    conn = _RecConn(row={"baseline_id": "X"})
+    assert _read_decl(monkeypatch, conn) == "X"
+    (query, args), = conn.queries
+    assert " ".join(query.split()) == (
+        "SELECT baseline_id FROM asset_declaration WHERE asset_id = $1")
+    assert args == ("a1",)
+    assert conn.closed
+
+
+@pytest.mark.parametrize("row", [None, {"baseline_id": None}, {"baseline_id": ""}])
+def test_read_declared_baseline_absent_or_empty_is_none(monkeypatch, row):
+    conn = _RecConn(row=row)
+    assert _read_decl(monkeypatch, conn) is None
+    assert conn.closed
+
+
+def test_read_declared_baseline_missing_table_is_none_with_warning(
+    monkeypatch, caplog,
+):
+    import asyncpg
+    err = asyncpg.exceptions.UndefinedTableError(
+        'relation "asset_declaration" does not exist')
+    conn = _RecConn(error=err)
+    with caplog.at_level("WARNING"):
+        assert _read_decl(monkeypatch, conn) is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "asset_declaration table is absent" in warnings[0].getMessage()
+    assert conn.closed
+
+
+def test_read_declared_baseline_other_error_propagates(monkeypatch):
+    conn = _RecConn(error=OSError("unreachable"))
+    with pytest.raises(OSError):
+        _read_decl(monkeypatch, conn)
     assert conn.closed

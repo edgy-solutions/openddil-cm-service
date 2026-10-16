@@ -56,7 +56,7 @@ from as_maintained.persistence_model import (
     InstalledCiRecord,
     ModComplianceRecord,
 )
-from as_maintained.store_read import read_manual_discrepancies
+from as_maintained.store_read import read_declared_baseline, read_manual_discrepancies
 from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
 from discrepancy.analyzer import (
@@ -299,6 +299,9 @@ async def _load_or_init(
 ) -> AsMaintainedRecord | None:
     """Load existing record or initialize from baseline on first-seen.
 
+    On first-seen the asset's declaration in the tier store, when it names a
+    loaded baseline, wins over the variant default.
+
     Returns None if no baseline is available (asset registered but UNKNOWN).
     """
     stored = await ctx.get(_KEY_AM_STATE, type_hint=dict)
@@ -312,9 +315,36 @@ async def _load_or_init(
     # row carries real edge attribution from the start.
     edge_id, region_id = _extract_origin(silver_event)
 
+    # The tier store's declaration record may name this asset's baseline. A
+    # store error raises, so Restate retries rather than falling back to the
+    # variant default.
+    declared_id: str | None = None
+    if store_configured():
+        async def _read_decl() -> str | None:
+            return await read_declared_baseline(_store_dsn, asset_id)
+
+        declared_id = await ctx.run("read-declared-baseline", _read_decl)
+    declared = _baseline_by_id(declared_id) if declared_id else None
+    if declared_id and declared is None:
+        logger.warning(
+            "Asset %s declared baseline %s is not loaded; using the variant "
+            "default", asset_id, declared_id,
+        )
+    if declared is not None and variant and variant != "UNKNOWN":
+        default = _baselines().get(variant)
+        if default is None or default.baseline_id != declared_id:
+            logger.warning(
+                "Asset %s declared baseline %s differs from the variant %r "
+                "default %s; using the declaration",
+                asset_id, declared_id, variant,
+                default.baseline_id if default is not None else None,
+            )
+
     # The two REGISTERED branches below restore nothing: a REGISTERED asset
     # has no episodes to keep.
-    if not variant or variant == "UNKNOWN":
+    if declared is not None:
+        baseline = declared
+    elif not variant or variant == "UNKNOWN":
         logger.warning(
             "Asset %s first seen with platform_variant=%r — registering "
             "without baseline (lifecycle=REGISTERED)",
@@ -331,24 +361,24 @@ async def _load_or_init(
         ctx.set(_KEY_AM_STATE, _record_to_dict(record))
         await _emit_asset_cm_state(ctx, record)
         return None
-
-    baseline = _baselines().get(variant)
-    if baseline is None:
-        logger.warning(
-            "Asset %s has variant %r but no baseline is loaded — registering "
-            "without baseline (lifecycle=REGISTERED)",
-            asset_id, variant,
-        )
-        record = AsMaintainedRecord(
-            asset_id=asset_id,
-            lifecycle=am.LIFECYCLE_REGISTERED,
-            last_observed_at_ns=now_ns,
-            edge_id=edge_id,
-            region_id=region_id,
-        )
-        ctx.set(_KEY_AM_STATE, _record_to_dict(record))
-        await _emit_asset_cm_state(ctx, record)
-        return None
+    else:
+        baseline = _baselines().get(variant)
+        if baseline is None:
+            logger.warning(
+                "Asset %s has variant %r but no baseline is loaded — "
+                "registering without baseline (lifecycle=REGISTERED)",
+                asset_id, variant,
+            )
+            record = AsMaintainedRecord(
+                asset_id=asset_id,
+                lifecycle=am.LIFECYCLE_REGISTERED,
+                last_observed_at_ns=now_ns,
+                edge_id=edge_id,
+                region_id=region_id,
+            )
+            ctx.set(_KEY_AM_STATE, _record_to_dict(record))
+            await _emit_asset_cm_state(ctx, record)
+            return None
 
     proto = initialize_from_baseline(asset_id, baseline, ingest_time_ns=now_ns)
     proto.lifecycle = am.LIFECYCLE_ACTIVE
@@ -374,10 +404,17 @@ async def _load_or_init(
                 "(first-observed times kept)",
                 asset_id, len(record.manual_discrepancies),
             )
-    logger.info(
-        "Asset %s initialized against baseline %s (variant=%s)",
-        asset_id, baseline.baseline_id, variant,
-    )
+    if declared is not None:
+        logger.info(
+            "Asset %s initialized against declared baseline %s "
+            "(declaration; variant=%s)",
+            asset_id, baseline.baseline_id, variant,
+        )
+    else:
+        logger.info(
+            "Asset %s initialized against baseline %s (variant=%s)",
+            asset_id, baseline.baseline_id, variant,
+        )
     return record
 
 
