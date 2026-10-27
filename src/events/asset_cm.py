@@ -588,6 +588,43 @@ def _apply_event_to_record(
         ))
         return
 
+    if _get("manual_discrepancy_resolved"):
+        mr = _get("manual_discrepancy_resolved")
+        component = mr.get("component") or ""
+        fault_code = mr.get("faultCode") or mr.get("fault_code") or ""
+        resolved_by = _get("recorded_by") or ""
+        if not fault_code:
+            # Unkeyed entries are never resolved through this path.
+            logger.warning(
+                "discrepancy_resolve_ignored_unkeyed asset_id=%s "
+                "component=%s resolved_by=%s",
+                record.asset_id, component, resolved_by,
+            )
+            return
+        match = next(
+            (d for d in record.manual_discrepancies
+             if d.fault_code and d.component == component
+             and d.fault_code == fault_code),
+            None,
+        )
+        if match is None:
+            logger.info(
+                "discrepancy_resolve_no_open_episode asset_id=%s "
+                "component=%s fault_code=%s resolved_by=%s",
+                record.asset_id, component, fault_code, resolved_by,
+            )
+            return
+        record.manual_discrepancies = [
+            d for d in record.manual_discrepancies if d is not match
+        ]
+        logger.info(
+            "discrepancy_resolved asset_id=%s component=%s fault_code=%s "
+            "resolved_by=%s sources=%d",
+            record.asset_id, component, fault_code, resolved_by,
+            len(match.sources),
+        )
+        return
+
 
 def _baseline_by_id(baseline_id: str) -> cb.ConfigurationBaseline | None:
     for variant in _baselines().all_variants():

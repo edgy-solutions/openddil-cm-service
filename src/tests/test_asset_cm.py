@@ -1470,3 +1470,113 @@ def test_read_declared_baseline_other_error_propagates(monkeypatch):
     with pytest.raises(OSError):
         _read_decl(monkeypatch, conn)
     assert conn.closed
+
+
+# ---------------------------------------------------------------------------
+# Maintainer resolve: closes an open keyed episode (ManualDiscrepancyResolved).
+# ---------------------------------------------------------------------------
+
+def _resolve_cm_event(
+    *,
+    event_id: str = "res-1",
+    recorded_by: str = "maintainer.one",
+    component: str = "tr_module",
+    fault_code: str = "F-1234",
+    key: str = "manualDiscrepancyResolved",
+) -> dict:
+    return {
+        "eventId": event_id,
+        "recordedBy": recorded_by,
+        key: {
+            "component": component,
+            "faultCode": fault_code,
+            "resolution": "swapped module",
+        },
+    }
+
+
+def test_resolve_removes_only_matching_episode(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e1", recorded_by="op", source="operator_report",
+        component="tr_module", fault_code="F-1234",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e2", recorded_by="op", source="operator_report",
+        component="tr_module", fault_code="F-5678",
+    )))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e3", recorded_by="op", source="operator_report",
+        component="cooling_fan", fault_code="",
+    )))
+    assert len(ctx._state["am_state"]["manual_discrepancies"]) == 3
+
+    asyncio.run(apply_cm_event(ctx, _resolve_cm_event()))
+
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 2
+    assert {(d["component"], d["fault_code"]) for d in manual} == {
+        ("tr_module", "F-5678"), ("cooling_fan", ""),
+    }
+
+
+def test_resolve_with_no_open_episode_is_a_no_op(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e1", recorded_by="op", source="operator_report",
+        component="tr_module", fault_code="F-5678",
+    )))
+    asyncio.run(apply_cm_event(ctx, _resolve_cm_event()))
+    assert len(ctx._state["am_state"]["manual_discrepancies"]) == 1
+
+
+def test_raise_resolve_raise_starts_new_episode(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e1", recorded_by="op", source="operator_report",
+        component="tr_module",
+    )))
+    first = ctx._state["am_state"]["manual_discrepancies"][0]
+
+    ctx._now_ns += 60 * 1_000_000_000
+    asyncio.run(apply_cm_event(ctx, _resolve_cm_event()))
+    assert ctx._state["am_state"]["manual_discrepancies"] == []
+
+    ctx._now_ns += 60 * 1_000_000_000
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e2", recorded_by="op2", source="operator_report",
+        component="tr_module",
+    )))
+    manual = ctx._state["am_state"]["manual_discrepancies"]
+    assert len(manual) == 1
+    assert manual[0]["detected_at_ns"] > first["detected_at_ns"]
+    assert [s["event_id"] for s in manual[0]["sources"]] == ["e2"]
+
+
+def test_resolve_with_empty_fault_code_is_ignored(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e1", recorded_by="op", source="operator_report",
+        component="cooling_fan", fault_code="",
+    )))
+    asyncio.run(apply_cm_event(ctx, _resolve_cm_event(
+        component="cooling_fan", fault_code="",
+    )))
+    assert len(ctx._state["am_state"]["manual_discrepancies"]) == 1
+
+
+def test_resolve_accepts_snake_case_key(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id="e1", recorded_by="op", source="operator_report",
+        component="tr_module",
+    )))
+    evt = _resolve_cm_event(key="manual_discrepancy_resolved")
+    evt["manual_discrepancy_resolved"]["fault_code"] =         evt["manual_discrepancy_resolved"].pop("faultCode")
+    asyncio.run(apply_cm_event(ctx, evt))
+    assert ctx._state["am_state"]["manual_discrepancies"] == []
