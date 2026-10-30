@@ -1069,6 +1069,15 @@ def no_declaration_by_default(monkeypatch):
     monkeypatch.setattr(asset_cm, "read_declared_baseline", none, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_history_by_default(monkeypatch):
+    """No test reaches a real store for parts and mod history either."""
+    async def none(dsn, asset_id):
+        return None
+
+    monkeypatch.setattr(asset_cm, "read_maintained_history", none, raising=False)
+
+
 @pytest.fixture
 def store_dsn():
     asset_cm.set_store_dsn(_FAKE_DSN)
@@ -1303,6 +1312,201 @@ def test_store_read_closes_connection_on_error(monkeypatch):
     conn = _FakeConn(error=RuntimeError("boom"))
     with pytest.raises(RuntimeError):
         _read(monkeypatch, conn)
+    assert conn.closed
+
+
+# ---------------------------------------------------------------------------
+# Restoring parts and mod history from the tier store after a state wipe.
+# ---------------------------------------------------------------------------
+
+_HIST_BASELINE = "M1A2-SEPv3-Baseline-2024.2"
+_HIST_PARTS = [
+    {"slot_id": "engine", "ci_id": "AGT-1500-RevD", "installed_at_ns": 1793336552375590912},
+    {"slot_id": "transmission", "ci_id": "X-1100-3B", "installed_at_ns": 1793336552375590913},
+    {"slot_id": "fcs-computer", "ci_id": "FCS-SEPv3-A", "installed_at_ns": 1793336552375590914},
+    {"slot_id": "thermal-imager", "ci_id": "CITV-2A", "installed_at_ns": 1793336552375590915},
+]
+_HIST_MODS = [
+    {"state": am.MOD_STATE_APPLIED, "mod_id": "MWO-2024-117",
+     "applied_at_ns": 1793336552139041792, "applied_by_work_order": ""},
+    {"state": am.MOD_STATE_APPLIED, "mod_id": "MWO-2023-089",
+     "applied_at_ns": 1793336552139041793, "applied_by_work_order": "WO-7"},
+]
+
+
+def _history(baseline_id=_HIST_BASELINE, installed=None, mod_status=None):
+    return {
+        "baseline_id": baseline_id,
+        "installed": [dict(x) for x in (_HIST_PARTS if installed is None else installed)],
+        "mod_status": [dict(x) for x in (_HIST_MODS if mod_status is None else mod_status)],
+    }
+
+
+def _patch_history(monkeypatch, result):
+    calls: list[tuple[str, str]] = []
+
+    async def fake(dsn, asset_id):
+        calls.append((dsn, asset_id))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(asset_cm, "read_maintained_history", fake)
+
+    async def no_manual(dsn, asset_id):
+        return None
+
+    monkeypatch.setattr(asset_cm, "read_manual_discrepancies", no_manual)
+    return calls
+
+
+def _emitted_state(published):
+    return [json.loads(v) for t, _, v in published if t == "asset-cm-state"][-1]
+
+
+def _observe_with_history(monkeypatch, result):
+    _patch_history(monkeypatch, result)
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    return ctx._state["am_state"]
+
+
+def test_history_restored_after_wipe_reaches_state_and_emit(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    published = install_registry_and_publisher
+    state = _observe_with_history(monkeypatch, _history())
+    emitted = _emitted_state(published)
+    for view in (state, emitted):
+        by_slot = {i["slot_id"]: i for i in view["installed"]}
+        assert by_slot["engine"]["ci_id"] == "AGT-1500-RevD"
+        assert by_slot["engine"]["installed_at_ns"] == 1793336552375590912
+        by_mod = {m["mod_id"]: m for m in view["mod_status"]}
+        assert by_mod["MWO-2024-117"]["state"] == am.MOD_STATE_APPLIED
+        assert by_mod["MWO-2024-117"]["applied_at_ns"] == 1793336552139041792
+        assert by_mod["MWO-2023-089"]["applied_by_work_order"] == "WO-7"
+    assert emitted["overall_status"] == am.CONFIG_STATUS_IN_COMPLIANCE
+
+
+def test_without_history_the_same_asset_is_not_in_compliance(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    published = install_registry_and_publisher
+    _observe_with_history(monkeypatch, None)
+    assert _emitted_state(published)["overall_status"] != am.CONFIG_STATUS_IN_COMPLIANCE
+
+
+def test_history_with_other_baseline_is_not_restored(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    want = _observe_with_history(monkeypatch, None)
+    got = _observe_with_history(monkeypatch, _history(baseline_id="Some-Other-Baseline-1.0"))
+    assert got["installed"] == want["installed"]
+    assert got["mod_status"] == want["mod_status"]
+    assert got["overall_status"] != am.CONFIG_STATUS_IN_COMPLIANCE
+
+
+@pytest.mark.parametrize("result", [None, _history(installed=[], mod_status=[])])
+def test_no_row_or_empty_lists_keep_the_defaults(
+    install_registry_and_publisher, store_dsn, monkeypatch, result,
+):
+    want = _observe_with_history(monkeypatch, None)
+    got = _observe_with_history(monkeypatch, result)
+    assert got["installed"] == want["installed"]
+    assert got["mod_status"] == want["mod_status"]
+
+
+def test_history_store_error_raises_and_leaves_no_state(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    _patch_history(monkeypatch, RuntimeError("store unreachable"))
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    with pytest.raises(RuntimeError):
+        asyncio.run(observe(ctx, _silver_event_dict()))
+    assert "am_state" not in ctx._state
+
+
+def test_history_no_dsn_never_calls_the_store(
+    install_registry_and_publisher, monkeypatch,
+):
+    calls = _patch_history(monkeypatch, _history())
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert calls == []
+    assert not any(label == "restore-maintained-history" for label, _ in ctx.runs)
+
+
+def test_history_absent_slot_and_mod_are_appended_unknown_keys_dropped(
+    install_registry_and_publisher, store_dsn, monkeypatch,
+):
+    hist = _history(
+        installed=_HIST_PARTS + [
+            {"slot_id": "extra-slot", "ci_id": "X-1", "installed_at_ns": "77",
+             "not_a_field": "dropped"},
+            {"ci_id": "no-slot"},
+        ],
+        mod_status=_HIST_MODS + [
+            {"mod_id": "MWO-EXTRA", "state": "4", "applied_at_ns": "88",
+             "not_a_field": "dropped"},
+            {"state": 4},
+        ],
+    )
+    got = _observe_with_history(monkeypatch, hist)
+    extra = next(i for i in got["installed"] if i["slot_id"] == "extra-slot")
+    assert extra == {"slot_id": "extra-slot", "ci_id": "X-1", "installed_at_ns": 77}
+    assert not any(i.get("ci_id") == "no-slot" for i in got["installed"])
+    mod = next(m for m in got["mod_status"] if m["mod_id"] == "MWO-EXTRA")
+    assert mod["state"] == 4 and mod["applied_at_ns"] == 88
+    assert "not_a_field" not in mod
+    assert len(got["mod_status"]) == 3
+
+
+def _read_history(monkeypatch, conn):
+    from as_maintained import store_read
+    seen = {}
+
+    async def fake_connect(dsn, **kw):
+        seen.update(kw)
+        return conn
+
+    monkeypatch.setattr(store_read.asyncpg, "connect", fake_connect)
+    return asyncio.run(store_read.read_maintained_history(_FAKE_DSN, "a1")), seen
+
+
+def test_read_maintained_history_row_absent_is_none(monkeypatch):
+    conn = _FakeConn(row=None)
+    result, seen = _read_history(monkeypatch, conn)
+    assert result is None
+    assert seen["server_settings"] == {"default_transaction_read_only": "on"}
+    assert conn.closed
+
+
+def test_read_maintained_history_decodes_jsonb_text_and_lists(monkeypatch):
+    conn = _FakeConn(row={
+        "baseline_id": "B-1",
+        "installed": json.dumps([{"slot_id": "s"}]),
+        "mod_status": [{"mod_id": "m"}],
+    })
+    result, _ = _read_history(monkeypatch, conn)
+    assert result == {
+        "baseline_id": "B-1",
+        "installed": [{"slot_id": "s"}],
+        "mod_status": [{"mod_id": "m"}],
+    }
+    assert conn.closed
+
+
+def test_read_maintained_history_non_list_is_empty(monkeypatch):
+    conn = _FakeConn(row={"baseline_id": None, "installed": None,
+                          "mod_status": json.dumps({"a": 1})})
+    result, _ = _read_history(monkeypatch, conn)
+    assert result == {"baseline_id": None, "installed": [], "mod_status": []}
+
+
+def test_read_maintained_history_closes_connection_on_error(monkeypatch):
+    conn = _FakeConn(error=RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        _read_history(monkeypatch, conn)
     assert conn.closed
 
 

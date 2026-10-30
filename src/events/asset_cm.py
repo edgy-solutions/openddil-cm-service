@@ -59,7 +59,11 @@ from as_maintained.persistence_model import (
     InstalledCiRecord,
     ModComplianceRecord,
 )
-from as_maintained.store_read import read_declared_baseline, read_manual_discrepancies
+from as_maintained.store_read import (
+    read_declared_baseline,
+    read_maintained_history,
+    read_manual_discrepancies,
+)
 from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
 from discrepancy.analyzer import (
@@ -407,6 +411,30 @@ async def _load_or_init(
                 "(first-observed times kept)",
                 asset_id, len(record.manual_discrepancies),
             )
+
+        # Applied mods and replaced parts live in the same row. They are
+        # merged over the baseline defaults only when the stored row was
+        # written against the baseline this record was just built from;
+        # baseline_assigned resets them on a change, so a differing row's
+        # history belongs to another baseline.
+        async def _restore_history() -> dict | None:
+            return await read_maintained_history(dsn, asset_id)
+
+        stored_hist = await ctx.run("restore-maintained-history", _restore_history)
+        if stored_hist:
+            if stored_hist.get("baseline_id") == record.baseline_id:
+                n_parts, n_mods = _merge_restored_history(record, stored_hist)
+                logger.info(
+                    "Asset %s restored %d installed part(s) and %d mod(s) "
+                    "from the store",
+                    asset_id, n_parts, n_mods,
+                )
+            else:
+                logger.info(
+                    "Asset %s stored baseline %r differs from %r; keeping "
+                    "baseline defaults for parts and mods",
+                    asset_id, stored_hist.get("baseline_id"), record.baseline_id,
+                )
     if declared is not None:
         logger.info(
             "Asset %s initialized against declared baseline %s "
@@ -1150,6 +1178,50 @@ def _disc_from_restored(x: dict) -> DiscrepancyRecord:
             srcs.append(s)
         x["sources"] = srcs
     return _disc_from_dict(x)
+
+
+def _merge_restored_history(
+    record: AsMaintainedRecord, stored: dict,
+) -> tuple[int, int]:
+    """Merge stored installed parts and mod history over the record's defaults.
+
+    Keyed by slot_id and mod_id: a stored entry replaces the default with the
+    same key or is appended, as the part_replaced and mod_applied handlers do.
+    Returns (parts merged, mods merged).
+    """
+    ci_fields = {f.name for f in dataclasses.fields(InstalledCiRecord)}
+    mod_fields = {f.name for f in dataclasses.fields(ModComplianceRecord)}
+    n_parts = n_mods = 0
+    for x in stored.get("installed") or []:
+        x = {k: v for k, v in x.items() if k in ci_fields}
+        if not x.get("slot_id"):
+            continue
+        if "installed_at_ns" in x:
+            x["installed_at_ns"] = int(x["installed_at_ns"])
+        entry = InstalledCiRecord(**x)
+        for i, cur in enumerate(record.installed):
+            if cur.slot_id == entry.slot_id:
+                record.installed[i] = entry
+                break
+        else:
+            record.installed.append(entry)
+        n_parts += 1
+    for x in stored.get("mod_status") or []:
+        x = {k: v for k, v in x.items() if k in mod_fields}
+        if not x.get("mod_id"):
+            continue
+        for key in ("applied_at_ns", "state"):
+            if key in x:
+                x[key] = int(x[key])
+        entry = ModComplianceRecord(**x)
+        for i, cur in enumerate(record.mod_status):
+            if cur.mod_id == entry.mod_id:
+                record.mod_status[i] = entry
+                break
+        else:
+            record.mod_status.append(entry)
+        n_mods += 1
+    return n_parts, n_mods
 
 
 def _mods_from_dicts(items) -> list[ModComplianceRecord]:
