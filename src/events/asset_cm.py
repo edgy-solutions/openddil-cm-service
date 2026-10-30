@@ -667,9 +667,9 @@ def _apply_event_to_record(
         #
         # KEY NOTE: the episode id is uuid5(asset|component|fault_code), so a
         # refile after closure gets the SAME discrepancy_id as the episode it
-        # follows. ADR-0051 §1 says the closed set is "keyed by the existing
-        # episode id"; it cannot be uniquely keyed by that id alone. The
-        # identity of a closed episode is (discrepancy_id, detected_at_ns).
+        # follows, so the closed set cannot be keyed by that id alone. The
+        # identity of a closed episode is (discrepancy_id, detected_at_ns),
+        # as ADR-0051 §1 states since its 2026-10-30 amendment.
         # The episode key itself is unchanged: the gate and egress depend on
         # it.
         ctx_entry = record.episode_context.pop(match.discrepancy_id, None)
