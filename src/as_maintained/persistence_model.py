@@ -106,6 +106,56 @@ class DiscrepancyRecord:
 
 
 @dataclass
+class EpisodeContextRecord:
+    """The asset's configuration frozen at the moment an episode OPENED
+    (ADR-0051 §2, baseline and mod list only).
+
+    Kept OFF DiscrepancyRecord on purpose: that dataclass is the wire shape
+    of `discrepancies` / `manual_discrepancies` on asset-cm-state, and
+    existing readers must see no change. Lives in
+    AsMaintainedRecord.episode_context keyed by discrepancy_id, and moves
+    into the ClosedEpisodeRecord when the episode closes. Every field has a
+    default so durable state written before this existed decodes.
+    """
+    detected_at_ns: int = 0
+    baseline_id: str = ""
+    mod_compliance: list[ModComplianceRecord] = field(default_factory=list)
+
+
+@dataclass
+class ClosedEpisodeRecord:
+    """A manual-discrepancy episode after `manual_discrepancy_resolved`
+    closed it (ADR-0051 §1). Append-only on AsMaintainedRecord.
+
+    IDENTITY IS (discrepancy_id, detected_at_ns), NOT discrepancy_id.
+    The episode id is uuid5(asset|component|fault_code), so a refile after
+    closure gets the SAME id as the episode it follows. ADR-0051 §1 says
+    the closed set is keyed by the existing episode id; that cannot be a
+    unique key on its own. The episode key itself is unchanged (the gate and
+    egress depend on it); only this list needs the pair.
+
+    Every field has a default so durable state written before this existed
+    decodes.
+    """
+    discrepancy_id: str = ""
+    type: int = 0
+    description: str = ""
+    severity: int = 0
+    recommended_action: str = ""
+    detected_at_ns: int = 0
+    component: str = ""
+    fault_code: str = ""
+    sources: list[DiscrepancySourceRecord] = field(default_factory=list)
+    cleared_at_ns: int = 0
+    cleared_by: str = ""
+    resolution: str = ""
+    # Frozen at open (EpisodeContextRecord); empty when the episode had no
+    # context entry (re-seeded from the store after a state wipe).
+    baseline_id: str = ""
+    mod_compliance: list[ModComplianceRecord] = field(default_factory=list)
+
+
+@dataclass
 class AsMaintainedRecord:
     """The full as-maintained configuration for one asset, in
     Restate-durable form. Stored as a single state key on the AssetCM
@@ -163,3 +213,11 @@ class AsMaintainedRecord:
     # last. Pre-ADR-0029 records decode with the default, as with edge_id.
     originator_nation: str = ""
     releasable_to: list[str] = field(default_factory=list)
+
+    # ADR-0051 slice item 1. Closed manual-discrepancy episodes, append-only
+    # (`manual_discrepancies` keeps meaning "open episodes only"), and the
+    # context frozen at open for each OPEN episode, keyed by discrepancy_id.
+    # Neither is published on asset-cm-state; ADR-0051 item 2 (the store
+    # table) decides what is projected.
+    closed_episodes: list[ClosedEpisodeRecord] = field(default_factory=list)
+    episode_context: dict[str, EpisodeContextRecord] = field(default_factory=dict)

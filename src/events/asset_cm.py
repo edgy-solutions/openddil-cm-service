@@ -23,6 +23,7 @@ Durable state keys on the object (one per asset_id):
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import logging
@@ -51,8 +52,10 @@ from openddil.telemetry.v1 import telemetry_pb2 as tel
 from as_maintained.persistence_model import (
     AdvisoryProvenanceRecord,
     AsMaintainedRecord,
+    ClosedEpisodeRecord,
     DiscrepancyRecord,
     DiscrepancySourceRecord,
+    EpisodeContextRecord,
     InstalledCiRecord,
     ModComplianceRecord,
 )
@@ -586,6 +589,19 @@ def _apply_event_to_record(
             fault_code=fault_code,
             sources=[source_entry],
         ))
+        # ADR-0051 §2: freeze the asset's configuration as it stands at the
+        # moment this episode OPENS. Only this branch writes it: a merge
+        # (second source) and the unkeyed branch never do, and neither do
+        # baseline_assigned, mod_applied or reanalysis. Frozen means frozen
+        # -- a mod applied between the first and second report must not
+        # appear. Deep-copied so a later mutation of record.mod_status in
+        # place (mod_applied edits entries) cannot reach it. Kept off
+        # DiscrepancyRecord, the asset-cm-state wire shape.
+        record.episode_context[discrepancy_id] = EpisodeContextRecord(
+            detected_at_ns=now_ns,
+            baseline_id=record.baseline_id,
+            mod_compliance=copy.deepcopy(record.mod_status),
+        )
         return
 
     if _get("manual_discrepancy_resolved"):
@@ -593,6 +609,7 @@ def _apply_event_to_record(
         component = mr.get("component") or ""
         fault_code = mr.get("faultCode") or mr.get("fault_code") or ""
         resolved_by = _get("recorded_by") or ""
+        resolution = mr.get("resolution") or ""
         if not fault_code:
             # Unkeyed entries are never resolved through this path.
             logger.warning(
@@ -617,6 +634,47 @@ def _apply_event_to_record(
         record.manual_discrepancies = [
             d for d in record.manual_discrepancies if d is not match
         ]
+        # ADR-0051 §1: keep the closed episode. `manual_discrepancies` keeps
+        # meaning "open episodes only"; `closed_episodes` is append-only.
+        #
+        # KEY NOTE: the episode id is uuid5(asset|component|fault_code), so a
+        # refile after closure gets the SAME discrepancy_id as the episode it
+        # follows. ADR-0051 §1 says the closed set is "keyed by the existing
+        # episode id"; it cannot be uniquely keyed by that id alone. The
+        # identity of a closed episode is (discrepancy_id, detected_at_ns).
+        # The episode key itself is unchanged: the gate and egress depend on
+        # it.
+        ctx_entry = record.episode_context.pop(match.discrepancy_id, None)
+        if ctx_entry is None:
+            # Opened before this code, or re-seeded from the store after a
+            # state wipe: nothing was frozen, and we do not invent it.
+            logger.info(
+                "episode_context_missing asset_id=%s discrepancy_id=%s",
+                record.asset_id, match.discrepancy_id,
+            )
+        recorded_at = _get("recorded_at")
+        cleared_at_ns = (
+            _iso_to_ns(recorded_at) if isinstance(recorded_at, str) and recorded_at
+            else now_ns
+        )
+        record.closed_episodes.append(ClosedEpisodeRecord(
+            discrepancy_id=match.discrepancy_id,
+            type=match.type,
+            description=match.description,
+            severity=match.severity,
+            recommended_action=match.recommended_action,
+            detected_at_ns=match.detected_at_ns,
+            component=match.component,
+            fault_code=match.fault_code,
+            sources=copy.deepcopy(match.sources),
+            cleared_at_ns=cleared_at_ns,
+            cleared_by=resolved_by,
+            resolution=resolution,
+            baseline_id=ctx_entry.baseline_id if ctx_entry else "",
+            mod_compliance=(
+                copy.deepcopy(ctx_entry.mod_compliance) if ctx_entry else []
+            ),
+        ))
         logger.info(
             "discrepancy_resolved asset_id=%s component=%s fault_code=%s "
             "resolved_by=%s sources=%d",
@@ -668,9 +726,16 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     preserved_region = record.region_id
     preserved_nation = record.originator_nation
     preserved_releasable = list(record.releasable_to)
+    # ADR-0051 slice item 1: closed episodes and the context frozen at open
+    # are dataclass-only too. Losing them here would be the same silent
+    # partial propagation: the history is there until the next recompute.
+    preserved_closed = list(record.closed_episodes)
+    preserved_context = dict(record.episode_context)
 
     if not record.baseline_id:
         record.manual_discrepancies = preserved_manual
+        record.closed_episodes = preserved_closed
+        record.episode_context = preserved_context
         return record  # registered but no baseline assigned
 
     baseline = _baseline_by_id(record.baseline_id)
@@ -680,6 +745,8 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
             record.asset_id, record.baseline_id,
         )
         record.manual_discrepancies = preserved_manual
+        record.closed_episodes = preserved_closed
+        record.episode_context = preserved_context
         return record
 
     proto = record_to_proto(record)
@@ -700,6 +767,8 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     out.region_id = preserved_region
     out.originator_nation = preserved_nation
     out.releasable_to = preserved_releasable
+    out.closed_episodes = preserved_closed
+    out.episode_context = preserved_context
     return out
 
 
@@ -763,6 +832,11 @@ async def _emit_asset_cm_state(
     publish is journaled, so retries don't double-publish.
     """
     payload = _record_to_dict(record)
+    # ADR-0051 slice item 1: durable-state-only fields. `_record_to_dict` is
+    # asdict, so it carries them; the wire shape of asset-cm-state must not
+    # change. ADR-0051 item 2 (the store table) decides what is projected.
+    payload.pop("closed_episodes", None)
+    payload.pop("episode_context", None)
     await ctx.run(
         "publish-asset-cm-state",
         lambda: _publish_kafka(
@@ -1078,6 +1152,37 @@ def _disc_from_restored(x: dict) -> DiscrepancyRecord:
     return _disc_from_dict(x)
 
 
+def _mods_from_dicts(items) -> list[ModComplianceRecord]:
+    return [
+        m if isinstance(m, ModComplianceRecord) else ModComplianceRecord(**m)
+        for m in (items or [])
+    ]
+
+
+def _closed_from_dict(x: dict) -> ClosedEpisodeRecord:
+    """Rebuild a ClosedEpisodeRecord; nested sources and mods are narrowed
+    for the same reason as `_disc_from_dict` (asdict flattens them)."""
+    x = dict(x)
+    sources = x.pop("sources", None) or []
+    mods = x.pop("mod_compliance", None)
+    rec = ClosedEpisodeRecord(**x)
+    rec.sources = [
+        s if isinstance(s, DiscrepancySourceRecord)
+        else DiscrepancySourceRecord(**s)
+        for s in sources
+    ]
+    rec.mod_compliance = _mods_from_dicts(mods)
+    return rec
+
+
+def _context_from_dict(x: dict) -> EpisodeContextRecord:
+    x = dict(x)
+    mods = x.pop("mod_compliance", None)
+    rec = EpisodeContextRecord(**x)
+    rec.mod_compliance = _mods_from_dicts(mods)
+    return rec
+
+
 def _dict_to_record(d: dict) -> AsMaintainedRecord:
     return AsMaintainedRecord(
         asset_id=d.get("asset_id", ""),
@@ -1097,6 +1202,13 @@ def _dict_to_record(d: dict) -> AsMaintainedRecord:
         region_id=d.get("region_id", ""),
         originator_nation=d.get("originator_nation", ""),
         releasable_to=list(d.get("releasable_to", [])),
+        closed_episodes=[
+            _closed_from_dict(x) for x in d.get("closed_episodes", [])
+        ],
+        episode_context={
+            k: _context_from_dict(v)
+            for k, v in (d.get("episode_context") or {}).items()
+        },
     )
 
 

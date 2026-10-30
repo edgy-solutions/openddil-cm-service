@@ -1580,3 +1580,213 @@ def test_resolve_accepts_snake_case_key(install_registry_and_publisher):
     evt["manual_discrepancy_resolved"]["fault_code"] =         evt["manual_discrepancy_resolved"].pop("faultCode")
     asyncio.run(apply_cm_event(ctx, evt))
     assert ctx._state["am_state"]["manual_discrepancies"] == []
+
+
+# ---------------------------------------------------------------------------
+# ADR-0051 slice item 1: closed episodes are kept; the episode freezes its
+# baseline and mod list at open.
+# ---------------------------------------------------------------------------
+
+def _mod_applied_event(mod_id: str = "MWO-ADR51") -> dict:
+    return {"modApplied": {"modId": mod_id}}
+
+
+def _open_episode(ctx, *, event_id="e1", fault_code="F-1234"):
+    asyncio.run(apply_cm_event(ctx, _episode_cm_event(
+        event_id=event_id, recorded_by="op", source="operator_report",
+        component="tr_module", fault_code=fault_code,
+    )))
+
+
+def _resolve_with_text(ctx, text="swapped module", by="maintainer.one"):
+    ev = _resolve_cm_event(recorded_by=by)
+    ev["manualDiscrepancyResolved"]["resolution"] = text
+    asyncio.run(apply_cm_event(ctx, ev))
+
+
+def _copy(x):
+    return json.loads(json.dumps(x))
+
+
+def test_episode_open_freezes_baseline_and_mods_and_merge_leaves_them(
+    install_registry_and_publisher,
+):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx)
+    st = ctx._state["am_state"]
+    assert len(st["manual_discrepancies"]) == 1
+    did = st["manual_discrepancies"][0]["discrepancy_id"]
+    frozen = st["episode_context"][did]
+    assert frozen["baseline_id"] == st["baseline_id"] != ""
+    assert frozen["mod_compliance"] == st["mod_status"]
+    assert frozen["detected_at_ns"] == st["manual_discrepancies"][0]["detected_at_ns"]
+    before = _copy(frozen)
+
+    # A mod applied, then a second source merged: neither may touch it.
+    asyncio.run(apply_cm_event(ctx, _mod_applied_event()))
+    ctx._now_ns += 5 * 1_000_000_000
+    _open_episode(ctx, event_id="e2")
+    st = ctx._state["am_state"]
+    assert len(st["manual_discrepancies"][0]["sources"]) == 2
+    assert st["mod_status"] != before["mod_compliance"], "mod did not change"
+    assert st["episode_context"][did] == before
+
+
+def test_resolve_keeps_the_closed_episode(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx)
+    st = ctx._state["am_state"]
+    opened = _copy(st["manual_discrepancies"][0])
+    frozen = _copy(st["episode_context"][opened["discrepancy_id"]])
+
+    ctx._now_ns += 60 * 1_000_000_000
+    _resolve_with_text(ctx)
+    st = ctx._state["am_state"]
+    assert st["manual_discrepancies"] == []
+    assert opened["discrepancy_id"] not in st["episode_context"]
+    assert len(st["closed_episodes"]) == 1
+    c = st["closed_episodes"][0]
+    assert c["discrepancy_id"] == opened["discrepancy_id"]
+    assert c["detected_at_ns"] == opened["detected_at_ns"]
+    assert c["sources"] == opened["sources"]
+    assert c["cleared_at_ns"] == ctx._now_ns
+    assert c["cleared_by"] == "maintainer.one"
+    assert c["resolution"] == "swapped module"
+    assert c["baseline_id"] == frozen["baseline_id"]
+    assert c["mod_compliance"] == frozen["mod_compliance"]
+
+
+def test_refile_after_close_opens_fresh_episode_same_id(
+    install_registry_and_publisher,
+):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx, event_id="e1")
+    first = _copy(ctx._state["am_state"]["manual_discrepancies"][0])
+    ctx._now_ns += 60 * 1_000_000_000
+    _resolve_with_text(ctx)
+    closed_once = _copy(ctx._state["am_state"]["closed_episodes"])
+
+    asyncio.run(apply_cm_event(ctx, _mod_applied_event()))
+    ctx._now_ns += 60 * 1_000_000_000
+    _open_episode(ctx, event_id="e2")
+    st = ctx._state["am_state"]
+    assert len(st["manual_discrepancies"]) == 1
+    again = st["manual_discrepancies"][0]
+    assert again["discrepancy_id"] == first["discrepancy_id"]
+    assert again["detected_at_ns"] > first["detected_at_ns"]
+    assert [s["event_id"] for s in again["sources"]] == ["e2"]
+    # fresh context reflects the mod applied between close and refile
+    ctxt = st["episode_context"][again["discrepancy_id"]]
+    assert ctxt["mod_compliance"] == st["mod_status"]
+    assert ctxt["mod_compliance"] != closed_once[0]["mod_compliance"]
+    assert ctxt["detected_at_ns"] == again["detected_at_ns"]
+    assert st["closed_episodes"] == closed_once
+
+
+def test_resolve_with_nothing_open_keeps_no_closed_entry(
+    install_registry_and_publisher,
+):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    before = _copy(ctx._state["am_state"])
+    _resolve_with_text(ctx)
+    after = ctx._state["am_state"]
+    assert after["closed_episodes"] == []
+    assert after == before
+
+
+def test_resolve_without_context_entry_closes_with_empty_context(
+    install_registry_and_publisher, caplog,
+):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx)
+    ctx._state["am_state"]["episode_context"] = {}   # as if opened pre-feature
+    with caplog.at_level("INFO"):
+        _resolve_with_text(ctx)
+    c = ctx._state["am_state"]["closed_episodes"][0]
+    assert c["baseline_id"] == "" and c["mod_compliance"] == []
+    assert "episode_context_missing" in caplog.text
+
+
+def test_closed_episodes_and_context_round_trip(install_registry_and_publisher):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx, event_id="e1")
+    _open_episode(ctx, event_id="e2")      # two sources, nested lists
+    ctx._now_ns += 60 * 1_000_000_000
+    _resolve_with_text(ctx)
+    _open_episode(ctx, event_id="e3", fault_code="F-9")   # open + context
+
+    r = asset_cm._dict_to_record(ctx._state["am_state"])
+    assert r.closed_episodes and r.episode_context
+    assert isinstance(r.closed_episodes[0].sources[0],
+                      asset_cm.DiscrepancySourceRecord)
+    assert asset_cm._dict_to_record(asset_cm._record_to_dict(r)) == r
+
+    # A second event after the round trip still sees them.
+    ctx._now_ns += 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    st = ctx._state["am_state"]
+    assert len(st["closed_episodes"]) == 1
+    assert len(st["episode_context"]) == 1
+
+    # Durable state written before these fields existed decodes to defaults.
+    old = {k: v for k, v in st.items()
+           if k not in ("closed_episodes", "episode_context")}
+    old_r = asset_cm._dict_to_record(old)
+    assert old_r.closed_episodes == [] and old_r.episode_context == {}
+
+
+def test_reanalysis_carries_closed_episodes_and_context(
+    install_registry_and_publisher,
+):
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx, event_id="e1")
+    ctx._now_ns += 60 * 1_000_000_000
+    _resolve_with_text(ctx)
+    _open_episode(ctx, event_id="e2", fault_code="F-9")
+    before = _copy(ctx._state["am_state"])
+    assert before["closed_episodes"] and before["episode_context"]
+
+    rec = asset_cm._dict_to_record(before)
+    out = asset_cm._reanalyze(rec, now_ns=ctx._now_ns + 1)
+    assert out.closed_episodes == rec.closed_episodes != []
+    assert out.episode_context == rec.episode_context != {}
+    # both early-return branches
+    nobase = asset_cm._dict_to_record(before)
+    nobase.baseline_id = ""
+    o2 = asset_cm._reanalyze(nobase, now_ns=ctx._now_ns + 1)
+    assert o2.closed_episodes and o2.episode_context
+    gone = asset_cm._dict_to_record(before)
+    gone.baseline_id = "no-such-baseline"
+    o3 = asset_cm._reanalyze(gone, now_ns=ctx._now_ns + 1)
+    assert o3.closed_episodes and o3.episode_context
+
+
+def test_asset_cm_state_payload_does_not_carry_the_new_fields(
+    install_registry_and_publisher,
+):
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    _open_episode(ctx)
+    ctx._now_ns += 60 * 1_000_000_000
+    _resolve_with_text(ctx)
+    _open_episode(ctx, event_id="e2", fault_code="F-9")
+    assert ctx._state["am_state"]["closed_episodes"]
+
+    states = [json.loads(v) for t, _k, v in published if t == "asset-cm-state"]
+    assert states
+    expected = {
+        "asset_id", "baseline_id", "as_of_ns", "installed", "mod_status",
+        "discrepancies", "overall_status", "lifecycle",
+        "last_observed_at_ns", "last_alerted_status", "manual_discrepancies",
+        "edge_id", "region_id", "originator_nation", "releasable_to",
+    }
+    for payload in states:
+        assert set(payload) == expected
