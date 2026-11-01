@@ -1989,8 +1989,163 @@ def test_asset_cm_state_payload_does_not_carry_the_new_fields(
     expected = {
         "asset_id", "baseline_id", "as_of_ns", "installed", "mod_status",
         "discrepancies", "overall_status", "lifecycle",
-        "last_observed_at_ns", "last_alerted_status", "manual_discrepancies",
+        "last_alerted_status", "manual_discrepancies",
         "edge_id", "region_id", "originator_nation", "releasable_to",
     }
     for payload in states:
         assert set(payload) == expected
+
+
+# ---------------------------------------------------------------------------
+# CM state is written on CM change only; detection times are never re-stamped
+# ---------------------------------------------------------------------------
+
+def _cm_publishes(published):
+    return [json.loads(v) for t, _k, v in published if t == "asset-cm-state"]
+
+
+def _analyzer_times(discs):
+    # discrepancy_id is shared by every unverified-slot finding on an asset;
+    # the advisory inputs (which name the slot) tell them apart.
+    return {
+        (d["discrepancy_id"], tuple(d["advisory_provenance"]["inputs"])): (
+            d["detected_at_ns"], d["advisory_provenance"]["generated_at_ns"],
+        )
+        for d in discs
+    }
+
+
+def test_reobserve_keeps_detection_times(install_registry_and_publisher):
+    published = install_registry_and_publisher
+    t1 = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=t1)
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    first = _analyzer_times(ctx._state["am_state"]["discrepancies"])
+    assert first, "baseline must yield at least one analyzer discrepancy"
+    assert all(v == (t1, t1) for v in first.values())
+
+    ctx._now_ns = t2 = t1 + 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert _analyzer_times(ctx._state["am_state"]["discrepancies"]) == first
+    last = _cm_publishes(published)[-1]
+    assert _analyzer_times(last["discrepancies"]) == first
+
+    ctx._now_ns = t1 + 20 * 1_000_000_000
+    asyncio.run(recheck_compliance(ctx, {}))
+    assert _analyzer_times(ctx._state["am_state"]["discrepancies"]) == first
+    assert _analyzer_times(_cm_publishes(published)[-1]["discrepancies"]) == first
+    assert t2 > t1
+
+
+def test_two_identical_observes_publish_once(install_registry_and_publisher):
+    published = install_registry_and_publisher
+    t1 = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=t1)
+    sets = []
+    real_set = ctx.set
+    ctx.set = lambda n, v: (sets.append(n), real_set(n, v))[1]
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    ctx._now_ns = t2 = t1 + 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert len(_cm_publishes(published)) == 1
+    assert sets.count("am_state") == 2
+    assert ctx._state["am_state"]["last_observed_at_ns"] == t2
+
+
+def test_real_change_publishes_again(install_registry_and_publisher):
+    published = install_registry_and_publisher
+    t1 = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=t1)
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    n = len(_cm_publishes(published))
+
+    ctx._now_ns += 1_000_000_000
+    asyncio.run(apply_cm_event(ctx, {
+        "eventId": "t-mod",
+        "assetId": "dis:1:1:4773",
+        "modApplied": {"modId": "MWO-2024-117",
+                       "appliedAt": "2026-05-12T11:00:00Z"},
+    }))
+    assert len(_cm_publishes(published)) == n + 1
+    n += 1
+
+    ctx._now_ns += 1_000_000_000
+    asyncio.run(apply_cm_event(ctx, {
+        "manualDiscrepancy": {
+            "description": "Visual: hatch hinge cracked",
+            "severity": "MAJOR",
+            "recommendedAction": "Replace hatch assembly",
+        },
+    }))
+    assert len(_cm_publishes(published)) == n + 1
+    n += 1
+
+    # ACTIVE -> STALE publishes, STALE -> ACTIVE publishes.
+    ctx._now_ns += (asset_cm.STALENESS_WINDOW_S + 60) * 1_000_000_000
+    asyncio.run(recheck_compliance(ctx, {}))
+    assert len(_cm_publishes(published)) == n + 1
+    n += 1
+    ctx._now_ns += 60 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert len(_cm_publishes(published)) == n + 1
+    assert _cm_publishes(published)[-1]["lifecycle"] == am.LIFECYCLE_ACTIVE
+
+
+def test_changed_advisory_restamps_only_generated_at(
+    install_registry_and_publisher, monkeypatch,
+):
+    t1 = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=t1)
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    first = _analyzer_times(ctx._state["am_state"]["discrepancies"])
+
+    real = asset_cm.compute_discrepancies
+
+    def changed(*a, **kw):
+        out = real(*a, **kw)
+        for d in out:
+            d.recommended_action += " (revised)"
+        return out
+
+    monkeypatch.setattr(asset_cm, "compute_discrepancies", changed)
+    ctx._now_ns = t2 = t1 + 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    second = _analyzer_times(ctx._state["am_state"]["discrepancies"])
+    assert set(second) == set(first)
+    for did, (detected, generated) in second.items():
+        assert detected == first[did][0] == t1
+        assert generated == t2
+
+
+def test_returning_finding_gets_a_new_detection_time(
+    install_registry_and_publisher, monkeypatch,
+):
+    t1 = _now_ns()
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=t1)
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    first = _analyzer_times(ctx._state["am_state"]["discrepancies"])
+    assert first
+
+    real = asset_cm.compute_discrepancies
+    monkeypatch.setattr(asset_cm, "compute_discrepancies",
+                        lambda *a, **kw: [])
+    ctx._now_ns = t2 = t1 + 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    assert ctx._state["am_state"]["discrepancies"] == []
+
+    monkeypatch.setattr(asset_cm, "compute_discrepancies", real)
+    ctx._now_ns = t3 = t2 + 10 * 1_000_000_000
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    back = _analyzer_times(ctx._state["am_state"]["discrepancies"])
+    assert set(back) == set(first)
+    assert all(v == (t3, t3) for v in back.values())
+
+
+def test_observation_clock_is_not_on_the_wire(install_registry_and_publisher):
+    published = install_registry_and_publisher
+    ctx = StubCtx(key="dis:1:1:4773", now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict()))
+    payloads = _cm_publishes(published)
+    assert payloads
+    assert all("last_observed_at_ns" not in p for p in payloads)
+    assert "last_observed_at_ns" in ctx._state["am_state"]

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -790,6 +791,10 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     proto.as_of.FromNanoseconds(now_ns)
 
     out = proto_to_record(proto)
+    # Carry "first observed" forward on the dataclass side, after the proto
+    # round-trip: the analyzer rebuilds every finding with now, but a finding
+    # whose id was already open is the same finding, not a new one.
+    _carry_detection_times(record.discrepancies, out.discrepancies)
     out.manual_discrepancies = preserved_manual
     out.edge_id = preserved_edge
     out.region_id = preserved_region
@@ -798,6 +803,44 @@ def _reanalyze(record: AsMaintainedRecord, *, now_ns: int) -> AsMaintainedRecord
     out.closed_episodes = preserved_closed
     out.episode_context = preserved_context
     return out
+
+
+def _carry_detection_times(
+    previous: list[DiscrepancyRecord],
+    current: list[DiscrepancyRecord],
+) -> None:
+    """Keep detected_at_ns (and the advisory's generated_at_ns when the
+    advisory content is unchanged) for analyzer findings that were already
+    open (matched on discrepancy_id plus advisory inputs, see below). A
+    finding with no previous match keeps now, so a finding that
+    clears and later returns is a new episode. Mutates `current`."""
+    # discrepancy_id alone is not unique within one analysis: the analyzer
+    # hashes asset, type and related ci/mod only, so every "unverified slot"
+    # finding on an asset shares one id. The advisory's `inputs` carry the
+    # slot, so the identity of a finding is (id, inputs). Any residual
+    # collision pairs in output order.
+    prev_by_key: dict[tuple, list[DiscrepancyRecord]] = {}
+    for d in previous:
+        prev_by_key.setdefault(
+            (d.discrepancy_id, tuple(d.advisory_provenance.inputs)), []
+        ).append(d)
+    for d in current:
+        matches = prev_by_key.get(
+            (d.discrepancy_id, tuple(d.advisory_provenance.inputs))
+        )
+        if not matches:
+            continue
+        prev = matches.pop(0)
+        d.detected_at_ns = prev.detected_at_ns
+        same_advisory = (
+            prev.recommended_action == d.recommended_action
+            and dataclasses.replace(prev.advisory_provenance, generated_at_ns=0)
+            == dataclasses.replace(d.advisory_provenance, generated_at_ns=0)
+        )
+        if same_advisory:
+            d.advisory_provenance.generated_at_ns = (
+                prev.advisory_provenance.generated_at_ns
+            )
 
 
 # `_disc_record_to_proto_local` lived here and was a hand copy of
@@ -850,6 +893,9 @@ async def _persist_and_emit_transitions(
     await _emit_asset_cm_state(ctx, record)
 
 
+_KEY_CM_STATE_EMIT_SIG = "cm_state_emit_sig"
+
+
 async def _emit_asset_cm_state(
     ctx: restate.ObjectContext,
     record: AsMaintainedRecord,
@@ -865,6 +911,27 @@ async def _emit_asset_cm_state(
     # change. ADR-0051 item 2 (the store table) decides what is projected.
     payload.pop("closed_episodes", None)
     payload.pop("episode_context", None)
+    # The asset's observation clock is telemetry_latest_state.last_sample_at,
+    # in the asset's reporting row, which every sample already writes. It
+    # stays on the record and in Restate state (it drives STALE) but is not
+    # part of the wire, so a sample alone does not change the payload.
+    payload.pop("last_observed_at_ns", None)
+    # Publish only when the wire payload changed. as_of_ns is excluded from
+    # the signature, so the published as_of_ns reads as "CM state as of its
+    # last change". A missing key (first call, Restate wipe) always publishes.
+    sig = hashlib.sha256(
+        json.dumps(
+            {k: v for k, v in payload.items() if k != "as_of_ns"},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if await ctx.get(_KEY_CM_STATE_EMIT_SIG, type_hint=str) == sig:
+        logger.debug(
+            "asset-cm-state unchanged for %s; publish suppressed",
+            record.asset_id,
+        )
+        return
+    ctx.set(_KEY_CM_STATE_EMIT_SIG, sig)
     await ctx.run(
         "publish-asset-cm-state",
         lambda: _publish_kafka(
