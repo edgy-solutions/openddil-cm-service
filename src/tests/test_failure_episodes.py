@@ -202,3 +202,126 @@ def test_refused_close_publishes_nothing_and_still_closes(published, caplog):
     assert _fe(published) == []
     assert len(ctx._state["am_state"]["closed_episodes"]) == 1
     assert f"failure_episode_refused reason=unlabelled asset_id={ASSET}" in caplog.text
+
+
+# -- the backfill -----------------------------------------------------------
+
+import backfill_failure_episodes as bf  # noqa: E402
+
+
+def _state_row(asset, n, nation="ATL", labels=True, start=0):
+    st = {"asset_id": asset, "edge_id": "edge-a", "region_id": "region-a",
+          "closed_episodes": [
+              _episode(discrepancy_id=f"ep-{asset}-{i}",
+                       detected_at_ns=1_700_000_000_000_000_000 + (start + i) * 10**9)
+              for i in range(n)]}
+    if labels:
+        st["originator_nation"] = nation
+        st["releasable_to"] = []
+    return {"service_key": asset, "value_utf8": json.dumps(st)}
+
+
+def _fetch(rows):
+    return lambda admin: rows
+
+
+def _run(admins=(), files=(), fetch=None, **kw):
+    out: list = []
+    summary = bf.run(list(admins), list(files), fetch=fetch or _fetch([]),
+                     publish=lambda t, k, v: out.append((t, k, v)), **kw)
+    return summary, out
+
+
+def _file_line(asset, i, **over):
+    obj = {"admin": "a", "asset": asset,
+           "asset_labels": {"originator_nation": "ATL", "releasable_to": ["BDR"]},
+           "asset_tier": TIER, "asset_as_of_ns": 1,
+           "episode": _episode(discrepancy_id=f"ep-f-{i}",
+                               detected_at_ns=1_700_000_000_000_000_000 + i)}
+    obj.update(over)
+    return json.dumps(obj)
+
+
+def test_backfill_live_state_emits_n_and_is_repeatable():
+    rows = [_state_row("asset-t-0001", 3), _state_row("asset-t-0002", 2)]
+    s1, out1 = _run(["http://admin-a:9070"], fetch=_fetch(rows))
+    s2, out2 = _run(["http://admin-a:9070"], fetch=_fetch(rows))
+    assert s1["emitted"] == 5 and s1["duplicate"] == 0 and s1["refusals"] == []
+    assert out1 == out2 and len(out1) == 5
+    assert {t for t, _, _ in out1} == {"failure-episodes"}
+    assert {k for _, k, _ in out1} == {"asset-t-0001", "asset-t-0002"}
+    rec = json.loads(out1[0][2])
+    assert rec["releasable_to"] == [] and rec["originator_nation"] == "ATL"
+    assert rec["edge_id"] == "edge-a"
+
+
+def test_backfill_state_and_file_overlap_emits_once(tmp_path):
+    rows = [_state_row("asset-t-0001", 2)]
+    f = tmp_path / "ep.jsonl"
+    ep = rows and json.loads(rows[0]["value_utf8"])["closed_episodes"][0]
+    f.write_text(_file_line("asset-t-0001", 0, episode=ep) + "\n")
+    s, out = _run(["http://admin-a:9070"], [str(f)], fetch=_fetch(rows))
+    assert s["emitted"] == 2 and s["duplicate"] == 1 and len(out) == 2
+
+
+def test_backfill_same_file_twice_emits_once_per_line(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    f.write_text("\n".join(_file_line("asset-t-0001", i) for i in range(3)) + "\n")
+    s, out = _run(files=[str(f), str(f)])
+    assert s["emitted"] == 3 and s["duplicate"] == 3 and len(out) == 3
+
+
+def test_backfill_export_file_k_lines(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    lines = [_file_line("asset-t-0001", i) for i in range(7)]
+    lines.insert(3, json.dumps({"summary": {"lines": 7}}))
+    f.write_text("\n".join(lines) + "\n")
+    s, out = _run(files=[str(f)])
+    assert s["emitted"] == 7 and len(out) == 7
+    assert s["skipped_summary_lines"] == 1 and s["refused"] == {}
+
+
+def test_backfill_empty_releasable_to_loads(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    f.write_text(_file_line("asset-t-0001", 0, asset_labels={
+        "originator_nation": "ATL", "releasable_to": []}) + "\n")
+    s, out = _run(files=[str(f)])
+    assert s["emitted"] == 1
+    assert json.loads(out[0][2])["releasable_to"] == []
+
+
+def test_backfill_red_lines_are_refused_counted_named(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    no_detected = json.loads(_file_line("asset-t-0001", 1))
+    del no_detected["episode"]["detected_at_ns"]
+    no_labels = json.loads(_file_line("asset-t-0001", 2))
+    del no_labels["asset_labels"]
+    f.write_text("\n".join([
+        json.dumps(no_detected), json.dumps(no_labels),
+        _file_line("asset-t-0001", 3, asset_labels={
+            "originator_nation": "", "releasable_to": []}),
+        "{not json",
+        _file_line("asset-t-0001", 4),
+    ]) + "\n")
+    s, out = _run(files=[str(f)])
+    assert s["emitted"] == 1 and len(out) == 1
+    assert s["refused"] == {"no_detected_at_ns": 1, "labels_never_exported": 1,
+                            "unlabelled": 1, "unparseable": 1}
+    assert [r["source"] for r in s["refusals"]] == [f"{f}:{n}" for n in (1, 2, 3, 4)]
+    assert s["refusals"][0]["asset_id"] == "asset-t-0001"
+    assert s["refusals"][0]["discrepancy_id"] == "ep-f-1"
+
+
+def test_backfill_state_row_without_label_key_or_nation_is_refused():
+    rows = [_state_row("asset-t-0001", 1, labels=False),
+            _state_row("asset-t-0002", 1, nation="")]
+    s, out = _run(["http://user:secret@admin-a:9070/x"], fetch=_fetch(rows))
+    assert out == [] and s["refused"] == {"labels_never_exported": 1, "unlabelled": 1}
+    assert s["refusals"][0]["source"] == "state:http://admin-a:9070"
+    assert "secret" not in json.dumps(s)
+
+
+def test_backfill_dry_run_publishes_nothing():
+    s, out = _run(["http://admin-a:9070"], fetch=_fetch([_state_row("asset-t-0001", 2)]),
+                  dry_run=True)
+    assert s["emitted"] == 2 and out == []
