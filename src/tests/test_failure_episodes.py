@@ -304,7 +304,7 @@ def test_backfill_red_lines_are_refused_counted_named(tmp_path):
         _file_line("asset-t-0001", 4),
     ]) + "\n")
     s, out = _run(files=[str(f)])
-    assert s["emitted"] == 1 and len(out) == 1
+    assert s["emitted"] == 1 and len([o for o in out if o[0] == fe.TOPIC]) == 1
     assert s["refused"] == {"no_detected_at_ns": 1, "labels_never_exported": 1,
                             "unlabelled": 1, "unparseable": 1}
     assert [r["source"] for r in s["refusals"]] == [f"{f}:{n}" for n in (1, 2, 3, 4)]
@@ -316,7 +316,7 @@ def test_backfill_state_row_without_label_key_or_nation_is_refused():
     rows = [_state_row("asset-t-0001", 1, labels=False),
             _state_row("asset-t-0002", 1, nation="")]
     s, out = _run(["http://user:secret@admin-a:9070/x"], fetch=_fetch(rows))
-    assert out == [] and s["refused"] == {"labels_never_exported": 1, "unlabelled": 1}
+    assert [o for o in out if o[0] == fe.TOPIC] == [] and s["refused"] == {"labels_never_exported": 1, "unlabelled": 1}
     assert s["refusals"][0]["source"] == "state:http://admin-a:9070"
     assert "secret" not in json.dumps(s)
 
@@ -325,3 +325,69 @@ def test_backfill_dry_run_publishes_nothing():
     s, out = _run(["http://admin-a:9070"], fetch=_fetch([_state_row("asset-t-0001", 2)]),
                   dry_run=True)
     assert s["emitted"] == 2 and out == []
+
+
+# -- the withheld record (S6) -----------------------------------------------
+
+WITHHELD_GOLDEN = Path(__file__).parent / "golden" / "failure_episode_withheld.json"
+
+
+def _withheld(published):
+    return [p for p in published if p[0] == fe.WITHHELD_TOPIC]
+
+
+def _counter(stage, reason):
+    from metrics import cm_failure_episode_withheld_total as c
+    return c.labels(stage=stage, reason=reason)._value.get()
+
+
+def _unlabelled_close():
+    ctx = StubCtx(key=ASSET, now_ns=_now_ns())
+    asyncio.run(observe(ctx, _silver_event_dict(asset_id=ASSET)))
+    _open(ctx)
+    ctx._now_ns += 60 * 1_000_000_000
+    return ctx
+
+
+def test_unlabelled_close_publishes_one_withheld_record(published):
+    before = _counter("emit", "unlabelled")
+    ctx = _unlabelled_close()
+    _close(ctx)
+    assert _fe(published) == []
+    w = _withheld(published)
+    assert len(w) == 1 and w[0][1] == ASSET
+    obj = json.loads(w[0][2])
+    assert obj["stage"] == "emit" and obj["reason"] == "unlabelled"
+    stored = ctx._state["am_state"]["closed_episodes"][0]
+    assert json.dumps(obj["episode"], sort_keys=True) == json.dumps(stored, sort_keys=True)
+    assert _counter("emit", "unlabelled") == before + 1
+
+
+def test_withheld_record_is_not_republished_on_replay(published):
+    ctx = _unlabelled_close()
+    before = copy.deepcopy(ctx._state)
+    first = JournalCtx(ASSET, _now_ns() + 10**9)
+    first._state = copy.deepcopy(before)
+    asyncio.run(apply_cm_event(first, _resolve_cm_event()))
+    assert len(_withheld(published)) == 1
+    retry = JournalCtx(ASSET, _now_ns() + 10**9, journal=first.journal)
+    retry._state = copy.deepcopy(before)
+    asyncio.run(apply_cm_event(retry, _resolve_cm_event()))
+    assert len(_withheld(published)) == 1
+
+
+def test_golden_withheld_record():
+    refusal = {"reason": "unlabelled", "asset_id": ASSET, "discrepancy_id": "ep-t-0001"}
+    value = fe.build_withheld(
+        ASSET, {"originator_nation": "", "releasable_to": []}, TIER,
+        _episode(), refusal, "emit")
+    if os.environ.get("REGEN_GOLDEN") == "1":
+        WITHHELD_GOLDEN.write_bytes(value)
+    assert value == WITHHELD_GOLDEN.read_bytes()
+
+
+def test_build_withheld_defaults_and_never_refuses():
+    v = fe.build_withheld("a", None, None, {}, {"reason": "unparseable"}, "backfill")
+    o = json.loads(v)
+    assert o["labels"] is None and o["discrepancy_id"] == "" and o["detected_at_ns"] == 0
+    assert o["tier"] == {"edge_id": "", "region_id": ""}

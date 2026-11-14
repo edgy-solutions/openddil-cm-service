@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 TOPIC = "failure-episodes"
+WITHHELD_TOPIC = "failure-episodes-withheld"
 
 REFUSAL_NO_DISCREPANCY_ID = "no_discrepancy_id"
 REFUSAL_NO_DETECTED_AT_NS = "no_detected_at_ns"
@@ -69,3 +70,31 @@ def build_record(
         "region_id": tier.get("region_id", "") or "",
     }
     return json.dumps(obj, sort_keys=True).encode("utf-8"), None
+
+
+def build_withheld(
+    asset_id: str,
+    labels: dict | None,
+    tier: dict | None,
+    episode: dict,
+    refusal: dict,
+    stage: str,
+) -> bytes:
+    """A refused episode, kept with its reason (ADR-0055: never dropped).
+
+    stage is "emit" or "backfill". Never refuses: everything is kept.
+    """
+    ep = episode or {}
+    tier = tier or {}
+    obj = {
+        "stage": stage,
+        "reason": refusal["reason"],
+        "asset_id": asset_id,
+        "discrepancy_id": refusal.get("discrepancy_id") or "",
+        "detected_at_ns": int(ep.get("detected_at_ns") or 0),
+        "labels": labels,
+        "tier": {"edge_id": tier.get("edge_id", "") or "",
+                 "region_id": tier.get("region_id", "") or ""},
+        "episode": episode,
+    }
+    return json.dumps(obj, sort_keys=True).encode("utf-8")

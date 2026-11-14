@@ -68,6 +68,7 @@ from as_maintained.store_read import (
 from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
 from events import failure_episodes as fe
+from metrics import cm_failure_episode_withheld_total
 from discrepancy.analyzer import (
     compute_discrepancies,
     initialize_from_baseline,
@@ -971,6 +972,23 @@ async def _emit_failure_episode(
             "failure_episode_refused reason=%s asset_id=%s discrepancy_id=%s",
             refusal["reason"], refusal["asset_id"], refusal["discrepancy_id"],
         )
+        withheld = fe.build_withheld(
+            record.asset_id,
+            {"originator_nation": record.originator_nation,
+             "releasable_to": record.releasable_to},
+            {"edge_id": record.edge_id, "region_id": record.region_id},
+            dataclasses.asdict(closed), refusal, "emit",
+        )
+        await ctx.run(
+            "publish-failure-episode-withheld",
+            lambda: _publish_kafka(  # produces: failure-episodes-withheld
+                topic=fe.WITHHELD_TOPIC,
+                key=record.asset_id,
+                value=withheld,
+            ),
+        )
+        cm_failure_episode_withheld_total.labels(
+            stage="emit", reason=refusal["reason"]).inc()
         return
     await ctx.run(
         "publish-failure-episode",

@@ -8,4 +8,5 @@ workloads:
     topics:
       - asset-cm-state
       - failure-episodes
+      - failure-episodes-withheld
       - tactical-events

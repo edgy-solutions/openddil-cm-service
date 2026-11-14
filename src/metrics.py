@@ -23,3 +23,9 @@ cm_removal_unknown_asset_dropped_total = Counter(
     "cm_removal_unknown_asset_dropped_total",
     "Remove Entity claims for an asset_id with no AssetCM state, dropped",
 )
+
+cm_failure_episode_withheld_total = Counter(
+    "cm_failure_episode_withheld_total",
+    "Refused failure episodes kept on failure-episodes-withheld",
+    ["stage", "reason"],
+)
