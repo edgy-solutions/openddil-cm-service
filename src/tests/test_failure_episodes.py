@@ -391,3 +391,37 @@ def test_build_withheld_defaults_and_never_refuses():
     o = json.loads(v)
     assert o["labels"] is None and o["discrepancy_id"] == "" and o["detected_at_ns"] == 0
     assert o["tier"] == {"edge_id": "", "region_id": ""}
+
+
+def _wh(out):
+    return [o for o in out if o[0] == fe.WITHHELD_TOPIC]
+
+
+def test_backfill_publishes_refusals_to_withheld(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    unlabelled = json.loads(_file_line("asset-t-0001", 2))
+    unlabelled["asset_labels"] = {"originator_nation": "", "releasable_to": []}
+    f.write_text("\n".join([
+        _file_line("asset-t-0001", 1), json.dumps(unlabelled), "{not json",
+    ]) + "\n")
+    b_unl = _counter("backfill", "unlabelled")
+    b_unp = _counter("backfill", "unparseable")
+    s, out = _run(files=[str(f)])
+    assert s["emitted"] == 1 and len([o for o in out if o[0] == fe.TOPIC]) == 1
+    assert s["withheld_published"] == 2 and len(_wh(out)) == 2
+    objs = [json.loads(o[2]) for o in _wh(out)]
+    assert [o["reason"] for o in objs] == ["unlabelled", "unparseable"]
+    assert all(o["stage"] == "backfill" for o in objs)
+    assert _wh(out)[0][1] == "asset-t-0001" and _wh(out)[1][1] == ""
+    assert objs[0]["episode"] == unlabelled["episode"]
+    assert objs[1]["episode"]["raw"].strip() == chr(123) + "not json"
+    assert objs[1]["discrepancy_id"] == ""
+    assert _counter("backfill", "unlabelled") == b_unl + 1
+    assert _counter("backfill", "unparseable") == b_unp + 1
+
+
+def test_backfill_dry_run_publishes_no_withheld(tmp_path):
+    f = tmp_path / "ep.jsonl"
+    f.write_text("{not json\n")
+    s, out = _run(files=[str(f)], dry_run=True)
+    assert out == [] and s["withheld_published"] == 0 and s["refused"] == {"unparseable": 1}

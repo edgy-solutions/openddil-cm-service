@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).parent))
 
 from events import failure_episodes as fe  # noqa: E402
+from metrics import cm_failure_episode_withheld_total  # noqa: E402
 
 QUERY = ("select service_key, value_utf8 from state "
          "where service_name='AssetCM' and key='am_state'")
@@ -81,16 +82,28 @@ def _iter_state(admin: str, fetch):
 
 def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> dict:
     emitted = 0
+    withheld_published = 0
     duplicate = 0
     refusals: list[dict] = []
     skipped_summary = 0
     seen: set[tuple[str, int]] = set()
+
+    def withhold(asset_id, labels, tier, episode, refusal):
+        nonlocal withheld_published
+        if dry_run:
+            return
+        publish(fe.WITHHELD_TOPIC, asset_id, fe.build_withheld(
+            asset_id, labels, tier, episode, refusal, "backfill"))
+        cm_failure_episode_withheld_total.labels(
+            stage="backfill", reason=refusal["reason"]).inc()
+        withheld_published += 1
 
     def handle(source, asset_id, labels, tier, episode):
         nonlocal emitted, duplicate
         value, refusal = fe.build_record(asset_id, labels, tier, episode)
         if refusal is not None:
             refusals.append({"source": source, **refusal})
+            withhold(asset_id, labels, tier, episode, refusal)
             return
         ident = (episode["discrepancy_id"], int(episode["detected_at_ns"]))
         if ident in seen:
@@ -122,8 +135,11 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
                     if not isinstance(obj, dict):
                         raise ValueError("not an object")
                 except ValueError:
-                    refusals.append({"source": src, "asset_id": "",
-                                     "discrepancy_id": "", "reason": "unparseable"})
+                    refusal = {"reason": "unparseable", "asset_id": "",
+                               "discrepancy_id": ""}
+                    refusals.append({"source": src, **refusal})
+                    withhold("", None, None,
+                             {"raw": raw.decode("utf-8", errors="replace")}, refusal)
                     continue
                 if "summary" in obj:
                     skipped_summary += 1
@@ -135,7 +151,8 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
     for r in refusals:
         counts[r["reason"]] = counts.get(r["reason"], 0) + 1
     return {"emitted": emitted, "duplicate": duplicate, "refused": counts,
-            "refusals": refusals, "skipped_summary_lines": skipped_summary}
+            "refusals": refusals, "skipped_summary_lines": skipped_summary,
+            "withheld_published": withheld_published}
 
 
 def main(argv=None) -> int:
