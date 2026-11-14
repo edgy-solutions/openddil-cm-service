@@ -66,10 +66,12 @@ def build_kafka_publisher():
 def _iter_state(admin: str, fetch):
     for row in fetch(admin):
         asset_id = row.get("service_key") or ""
+        raw = row.get("value_utf8")
         try:
-            st = json.loads(row.get("value_utf8") or "")
+            st = json.loads(raw or "")
         except (TypeError, ValueError):
-            yield asset_id, None, None, None
+            # eps is None: the caller withholds the raw value, the only copy.
+            yield asset_id, None, None, None, raw if isinstance(raw, str) else ""
             continue
         labels = None
         if "originator_nation" in st:
@@ -77,7 +79,7 @@ def _iter_state(admin: str, fetch):
                       "releasable_to": list(st.get("releasable_to") or [])}
         tier = {"edge_id": st.get("edge_id", ""), "region_id": st.get("region_id", "")}
         eps = st.get("closed_episodes") or []
-        yield asset_id, labels, tier, eps
+        yield asset_id, labels, tier, eps, None
 
 
 def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> dict:
@@ -116,10 +118,12 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
 
     for admin in admins:
         src = "state:" + _safe_url(admin)
-        for asset_id, labels, tier, eps in _iter_state(admin, fetch):
+        for asset_id, labels, tier, eps, raw in _iter_state(admin, fetch):
             if eps is None:
-                refusals.append({"source": src, "asset_id": asset_id,
-                                 "discrepancy_id": "", "reason": "unparseable"})
+                refusal = {"reason": "unparseable", "asset_id": asset_id,
+                           "discrepancy_id": ""}
+                refusals.append({"source": src, **refusal})
+                withhold(asset_id, None, None, {"raw": raw}, refusal)
                 continue
             for ep in eps:
                 handle(src, asset_id, labels, tier, ep)

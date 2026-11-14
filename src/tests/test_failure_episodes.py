@@ -425,3 +425,26 @@ def test_backfill_dry_run_publishes_no_withheld(tmp_path):
     f.write_text("{not json\n")
     s, out = _run(files=[str(f)], dry_run=True)
     assert out == [] and s["withheld_published"] == 0 and s["refused"] == {"unparseable": 1}
+
+
+def test_backfill_withholds_an_unparseable_state_row():
+    good = _state_row("asset-t-0001", 1)
+    bad = {"service_key": "asset-t-0002", "value_utf8": chr(123) + "not json"}
+    b = _counter("backfill", "unparseable")
+    s, out = _run(["http://admin-a:9070"], fetch=_fetch([good, bad]))
+    assert s["emitted"] == 1 and len([o for o in out if o[0] == fe.TOPIC]) == 1
+    assert s["withheld_published"] == 1 and len(_wh(out)) == 1
+    assert _wh(out)[0][1] == "asset-t-0002"
+    obj = json.loads(_wh(out)[0][2])
+    assert obj["stage"] == "backfill" and obj["reason"] == "unparseable"
+    assert obj["asset_id"] == "asset-t-0002"
+    assert obj["episode"] == {"raw": chr(123) + "not json"}
+    assert _counter("backfill", "unparseable") == b + 1
+
+
+def test_backfill_dry_run_publishes_no_withheld_state_row():
+    bad = {"service_key": "asset-t-0002", "value_utf8": chr(123) + "not json"}
+    s, out = _run(["http://admin-a:9070"], fetch=_fetch([_state_row("asset-t-0001", 1), bad]),
+                  dry_run=True)
+    assert out == [] and s["withheld_published"] == 0
+    assert s["refused"] == {"unparseable": 1}
