@@ -67,6 +67,8 @@ from as_maintained.store_read import (
 )
 from as_maintained.store import disc_record_to_proto, proto_to_record, record_to_proto
 from baselines.loader import BaselineRegistry
+from events import failure_episodes as fe
+from metrics import cm_failure_episode_withheld_total
 from discrepancy.analyzer import (
     compute_discrepancies,
     initialize_from_baseline,
@@ -245,10 +247,16 @@ async def apply_cm_event(ctx: restate.ObjectContext, event: bytes) -> None:
         return
 
     record = _dict_to_record(stored)
+    closed_before = len(record.closed_episodes)
     _apply_event_to_record(record, event, now_ns)
     record = _reanalyze(record, now_ns=now_ns)
 
     await _persist_and_emit_transitions(ctx, record, now_ns)
+    # `closed_episodes` is append-only, so entries past the old length are the
+    # closes this event made (the close itself is in _apply_event_to_record,
+    # which has no ctx).
+    for closed in record.closed_episodes[closed_before:]:
+        await _emit_failure_episode(ctx, record, closed)
     await _schedule_next_recheck(ctx, record, now_ns)
 
 
@@ -938,6 +946,56 @@ async def _emit_asset_cm_state(
             topic="asset-cm-state",
             key=record.asset_id,
             value=json.dumps(payload).encode("utf-8"),
+        ),
+    )
+
+
+async def _emit_failure_episode(
+    ctx: restate.ObjectContext,
+    record: AsMaintainedRecord,
+    closed: ClosedEpisodeRecord,
+) -> None:
+    """Publish one closed episode to failure-episodes, once per close.
+
+    Journaled through ctx.run, so a handler retry does not re-publish. A
+    refusal publishes nothing and is logged; the close itself is unchanged.
+    """
+    value, refusal = fe.build_record(
+        record.asset_id,
+        {"originator_nation": record.originator_nation,
+         "releasable_to": record.releasable_to},
+        {"edge_id": record.edge_id, "region_id": record.region_id},
+        dataclasses.asdict(closed),
+    )
+    if refusal is not None:
+        logger.warning(
+            "failure_episode_refused reason=%s asset_id=%s discrepancy_id=%s",
+            refusal["reason"], refusal["asset_id"], refusal["discrepancy_id"],
+        )
+        withheld = fe.build_withheld(
+            record.asset_id,
+            {"originator_nation": record.originator_nation,
+             "releasable_to": record.releasable_to},
+            {"edge_id": record.edge_id, "region_id": record.region_id},
+            dataclasses.asdict(closed), refusal, "emit",
+        )
+        await ctx.run(
+            "publish-failure-episode-withheld",
+            lambda: _publish_kafka(  # produces: failure-episodes-withheld
+                topic=fe.WITHHELD_TOPIC,
+                key=record.asset_id,
+                value=withheld,
+            ),
+        )
+        cm_failure_episode_withheld_total.labels(
+            stage="emit", reason=refusal["reason"]).inc()
+        return
+    await ctx.run(
+        "publish-failure-episode",
+        lambda: _publish_kafka(  # produces: failure-episodes
+            topic=fe.TOPIC,
+            key=record.asset_id,
+            value=value,
         ),
     )
 

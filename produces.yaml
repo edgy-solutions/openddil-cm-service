@@ -7,4 +7,6 @@ workloads:
     image: openddil/cm-service
     topics:
       - asset-cm-state
+      - failure-episodes
+      - failure-episodes-withheld
       - tactical-events
