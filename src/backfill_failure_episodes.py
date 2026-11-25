@@ -7,7 +7,11 @@ Not wired into startup or a Job (a chart follow-up). Run from src/:
 
 Every episode, live or from a file, goes through
 `events.failure_episodes.build_record`, the same builder the per-close emit
-uses. Within one run each (episode_id, detected_at_ns) is emitted once.
+uses. Tier rule (contracts #64 section 3.2): no tier on the close record
+means take it from the export's asset record, and refuse and count (reason
+`no_tier`) if that has none. The close record's block is used whole, or the
+asset's whole; ids are never mixed. A record is never written as the hub's
+for lack of a tier. Within one run each (episode_id, detected_at_ns) is emitted once.
 Prints one JSON summary line on stdout. Never prints a DSN, token or URL
 credentials.
 """
@@ -63,6 +67,20 @@ def build_kafka_publisher():
     return publish
 
 
+def _resolve_tier(episode, asset_tier) -> tuple[dict, str]:
+    """(tier block, source): "close_record", "asset_record" or "none"."""
+    if isinstance(episode, dict):
+        own = {"edge_id": episode.get("edge_id"),
+               "region_id": episode.get("region_id")}
+        if fe.has_tier(own):
+            return ({k: v if isinstance(v, str) else "" for k, v in own.items()},
+                    "close_record")
+    if fe.has_tier(asset_tier):
+        return ({k: asset_tier[k] if isinstance(asset_tier.get(k), str) else ""
+                 for k in ("edge_id", "region_id")}, "asset_record")
+    return {"edge_id": "", "region_id": ""}, "none"
+
+
 def _iter_state(admin: str, fetch):
     for row in fetch(admin):
         asset_id = row.get("service_key") or ""
@@ -89,6 +107,7 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
     refusals: list[dict] = []
     skipped_summary = 0
     seen: set[tuple[str, int]] = set()
+    tier_source = {"close_record": 0, "asset_record": 0}
 
     def withhold(asset_id, labels, tier, episode, refusal):
         nonlocal withheld_published
@@ -100,8 +119,9 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
             stage="backfill", reason=refusal["reason"]).inc()
         withheld_published += 1
 
-    def handle(source, asset_id, labels, tier, episode):
+    def handle(source, asset_id, labels, asset_tier, episode):
         nonlocal emitted, duplicate
+        tier, src_kind = _resolve_tier(episode, asset_tier)
         value, refusal = fe.build_record(asset_id, labels, tier, episode)
         if refusal is not None:
             refusals.append({"source": source, **refusal})
@@ -115,6 +135,7 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
         if not dry_run:
             publish(fe.TOPIC, asset_id, value)
         emitted += 1
+        tier_source[src_kind] += 1
 
     for admin in admins:
         src = "state:" + _safe_url(admin)
@@ -156,7 +177,8 @@ def run(admins, files, dry_run=False, fetch=fetch_state_rows, publish=None) -> d
         counts[r["reason"]] = counts.get(r["reason"], 0) + 1
     return {"emitted": emitted, "duplicate": duplicate, "refused": counts,
             "refusals": refusals, "skipped_summary_lines": skipped_summary,
-            "withheld_published": withheld_published}
+            "withheld_published": withheld_published,
+            "tier_source": tier_source}
 
 
 def main(argv=None) -> int:

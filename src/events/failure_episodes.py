@@ -20,6 +20,15 @@ REFUSAL_NO_DISCREPANCY_ID = "no_discrepancy_id"
 REFUSAL_NO_DETECTED_AT_NS = "no_detected_at_ns"
 REFUSAL_LABELS_NEVER_EXPORTED = "labels_never_exported"
 REFUSAL_UNLABELLED = "unlabelled"
+REFUSAL_NO_TIER = "no_tier"
+
+
+def has_tier(tier) -> bool:
+    """True when edge_id or region_id is a non-empty string."""
+    if not isinstance(tier, dict):
+        return False
+    return any(isinstance(tier.get(k), str) and tier.get(k)
+               for k in ("edge_id", "region_id"))
 
 
 def build_record(
@@ -31,7 +40,9 @@ def build_record(
     """Return (bytes, None) or (None, {"reason", "asset_id", "discrepancy_id"}).
 
     labels: {"originator_nation", "releasable_to"} or None (never exported).
-    tier: {"edge_id", "region_id"}.
+    tier: {"edge_id", "region_id"}. A tier block with neither id (a
+    non-empty string) is refused as no_tier; a record is never the hub's for
+    lack of one.
     episode: a ClosedEpisodeRecord as a dict (the stored form).
     """
     ep = episode or {}
@@ -51,6 +62,8 @@ def build_record(
     nation = labels.get("originator_nation") or ""
     if not nation:
         return refuse(REFUSAL_UNLABELLED)
+    if not has_tier(tier):
+        return refuse(REFUSAL_NO_TIER)
 
     obj = {
         "episode_id": did,
@@ -66,8 +79,9 @@ def build_record(
         "mod_compliance": list(ep.get("mod_compliance") or []),
         "originator_nation": nation,
         "releasable_to": list(labels.get("releasable_to") or []),
-        "edge_id": tier.get("edge_id", "") or "",
-        "region_id": tier.get("region_id", "") or "",
+        "edge_id": tier["edge_id"] if isinstance(tier.get("edge_id"), str) else "",
+        "region_id": (tier["region_id"]
+                      if isinstance(tier.get("region_id"), str) else ""),
     }
     return json.dumps(obj, sort_keys=True).encode("utf-8"), None
 
