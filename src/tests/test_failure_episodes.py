@@ -448,3 +448,127 @@ def test_backfill_dry_run_publishes_no_withheld_state_row():
                   dry_run=True)
     assert out == [] and s["withheld_published"] == 0
     assert s["refused"] == {"unparseable": 1}
+
+
+# -- the tier rule (contracts #64 section 3.2) -------------------------------
+
+@pytest.mark.parametrize("tier", [
+    None, {}, {"edge_id": "", "region_id": ""}, {"edge_id": None, "region_id": None},
+    {"edge_id": 7, "region_id": ["r"]}, "edge-a"])
+def test_build_record_refuses_no_tier(tier):
+    value, refusal = fe.build_record(ASSET, LABELS, tier, _episode())
+    assert value is None
+    assert refusal == {"reason": "no_tier", "asset_id": ASSET,
+                       "discrepancy_id": "ep-t-0001"}
+
+
+def test_build_record_accepts_edge_only_and_region_only():
+    v, r = fe.build_record(ASSET, LABELS, {"edge_id": "edge-a"}, _episode())
+    assert r is None and json.loads(v)["region_id"] == ""
+    v, r = fe.build_record(ASSET, LABELS, {"region_id": "region-a"}, _episode())
+    assert r is None and json.loads(v)["edge_id"] == ""
+
+
+def test_no_tier_is_checked_after_the_other_refusals():
+    _, r = fe.build_record(ASSET, None, {}, _episode())
+    assert r["reason"] == "labels_never_exported"
+
+
+def test_close_with_no_tier_withholds_and_publishes_no_record(published):
+    before = _counter("emit", "no_tier")
+    ctx = _labelled_ctx()
+    ctx._state["am_state"].update(edge_id="", region_id="")
+    _open(ctx)
+    ctx._now_ns += 60 * 1_000_000_000
+    _close(ctx)
+    assert _fe(published) == []
+    w = _withheld(published)
+    assert len(w) == 1
+    obj = json.loads(w[0][2])
+    assert obj["stage"] == "emit" and obj["reason"] == "no_tier"
+    assert _counter("emit", "no_tier") == before + 1
+
+
+def _tfile(tmp_path, lines):
+    f = tmp_path / "t.jsonl"
+    f.write_text("\n".join(lines) + "\n")
+    return str(f)
+
+
+def _notier_ep(i=0, **over):
+    return _episode(discrepancy_id=f"ep-f-{i}",
+                    detected_at_ns=1_700_000_000_000_000_000 + i, **over)
+
+
+def test_backfill_file_takes_tier_from_asset_record(tmp_path):
+    f = _tfile(tmp_path, [_file_line(
+        "asset-t-0001", 0, episode=_notier_ep(),
+        asset_tier={"edge_id": "edge-z", "region_id": "region-z"})])
+    s, out = _run(files=[f])
+    assert s["emitted"] == 1 and len(out) == 1
+    rec = json.loads(out[0][2])
+    assert (rec["edge_id"], rec["region_id"]) == ("edge-z", "region-z")
+    assert s["tier_source"] == {"close_record": 0, "asset_record": 1}
+
+
+def test_backfill_file_close_record_tier_wins(tmp_path):
+    f = _tfile(tmp_path, [_file_line(
+        "asset-t-0001", 0, episode=_notier_ep(edge_id="edge-e", region_id="region-e"),
+        asset_tier={"edge_id": "edge-z", "region_id": "region-z"})])
+    s, out = _run(files=[f])
+    rec = json.loads(out[0][2])
+    assert (rec["edge_id"], rec["region_id"]) == ("edge-e", "region-e")
+    assert s["tier_source"] == {"close_record": 1, "asset_record": 0}
+
+
+def test_backfill_tier_is_one_whole_block_never_mixed(tmp_path):
+    f = _tfile(tmp_path, [_file_line(
+        "asset-t-0001", 0, episode=_notier_ep(edge_id="edge-e"),
+        asset_tier={"region_id": "region-z"})])
+    s, out = _run(files=[f])
+    rec = json.loads(out[0][2])
+    assert (rec["edge_id"], rec["region_id"]) == ("edge-e", "")
+    assert s["tier_source"]["close_record"] == 1
+
+
+@pytest.mark.parametrize("asset_tier", [
+    "ABSENT", {}, {"edge_id": "", "region_id": ""}, "edge-a"])
+def test_backfill_file_no_tier_anywhere_is_refused(tmp_path, asset_tier):
+    over = {} if asset_tier != "ABSENT" else {}
+    line = json.loads(_file_line("asset-t-0001", 0, episode=_notier_ep(), **over))
+    if asset_tier == "ABSENT":
+        del line["asset_tier"]
+    else:
+        line["asset_tier"] = asset_tier
+    f = _tfile(tmp_path, [json.dumps(line)])
+    before = _counter("backfill", "no_tier")
+    s, out = _run(files=[f])
+    assert s["emitted"] == 0
+    assert s["refused"] == {"no_tier": 1}
+    assert [t for t, _, _ in out] == [fe.WITHHELD_TOPIC]
+    assert s["withheld_published"] == 1
+    assert _counter("backfill", "no_tier") == before + 1
+    assert s["tier_source"] == {"close_record": 0, "asset_record": 0}
+
+
+def test_backfill_state_row_without_ids_refused_with_ids_emits():
+    row = json.loads(_state_row("asset-t-0001", 2)["value_utf8"])
+    for e in row["closed_episodes"]:
+        pass
+    bare = dict(row, edge_id="", region_id="")
+    s, out = _run(["http://a:9070"], fetch=_fetch(
+        [{"service_key": "asset-t-0001", "value_utf8": json.dumps(bare)}]))
+    assert s["emitted"] == 0 and s["refused"] == {"no_tier": 2}
+    s, out = _run(["http://a:9070"], fetch=_fetch([_state_row("asset-t-0001", 2)]))
+    assert s["emitted"] == 2
+    assert s["tier_source"] == {"close_record": 0, "asset_record": 2}
+
+
+def test_backfill_dry_run_counts_no_tier_and_publishes_nothing(tmp_path):
+    line = json.loads(_file_line("asset-t-0001", 0, episode=_notier_ep()))
+    line["asset_tier"] = {}
+    f = _tfile(tmp_path, [json.dumps(line)])
+    before = _counter("backfill", "no_tier")
+    s, out = _run(files=[f], dry_run=True)
+    assert s["refused"] == {"no_tier": 1} and out == []
+    assert _counter("backfill", "no_tier") == before
