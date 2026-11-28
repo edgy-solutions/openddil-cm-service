@@ -572,3 +572,93 @@ def test_backfill_dry_run_counts_no_tier_and_publishes_nothing(tmp_path):
     s, out = _run(files=[f], dry_run=True)
     assert s["refused"] == {"no_tier": 1} and out == []
     assert _counter("backfill", "no_tier") == before
+
+
+# -- a first fault after a state wipe ---------------------------------------
+#
+# The upgrade-time Restate wipe deletes the AssetCM record; a fresh StubCtx
+# is that wiped state. The record is rebuilt by the next telemetry event, and
+# its labels come from that event's provenance only (ADR-0029 s3). The ingest
+# stamps the provenance from the asset's declaration, which the wipe keeps.
+# So the label after a wipe is whatever the feed states now: a declared asset
+# is labelled again by its first event, and an asset the feed no longer labels
+# stays unlabelled however it was labelled before.
+
+def _feed_event(nation=None, releasable=()):
+    ev = _silver_event_dict(asset_id=ASSET)
+    ev["provenance"].update(edgeId="edge-a", regionId="region-a")
+    if nation:
+        ev["provenance"]["originatorNation"] = nation
+        ev["provenance"]["releasableTo"] = list(releasable)
+    return ev
+
+
+def _life(ctx, event, fault_code="F-1234", event_id="e1"):
+    """One telemetry event, then a fault filed and closed a minute later."""
+    asyncio.run(observe(ctx, event))
+    _open(ctx, event_id=event_id, fault_code=fault_code)
+    ctx._now_ns += 60 * 1_000_000_000
+    _close(ctx)
+
+
+def test_declared_asset_first_fault_after_a_wipe_is_labelled(published):
+    before = StubCtx(key=ASSET, now_ns=_now_ns())
+    _life(before, _feed_event("ATL"))
+    assert len(_fe(published)) == 1
+
+    wiped = StubCtx(key=ASSET, now_ns=_now_ns() + 3600 * 10**9)
+    assert wiped._state == {}
+    _life(wiped, _feed_event("ATL"), event_id="e2")
+
+    got = _fe(published)
+    assert len(got) == 2 and _withheld(published) == []
+    rec = json.loads(got[1][2])
+    assert rec["originator_nation"] == "ATL" and rec["releasable_to"] == []
+    st = wiped._state["am_state"]
+    assert st["originator_nation"] == "ATL" and len(st["closed_episodes"]) == 1
+
+
+def test_label_the_feed_no_longer_states_is_not_carried_across_a_wipe(published):
+    """An asset labelled before the wipe whose feed now carries no nation
+    (no declaration at its edge, no stamp, no file row) is unlabelled after
+    it: its close is withheld as unlabelled, not published under the old
+    label. A last-known label left in the tier store is not a source."""
+    before = StubCtx(key=ASSET, now_ns=_now_ns())
+    _life(before, _feed_event("ATL"))
+    assert len(_fe(published)) == 1
+
+    wiped = StubCtx(key=ASSET, now_ns=_now_ns() + 3600 * 10**9)
+    _life(wiped, _feed_event(), event_id="e2")
+
+    assert len(_fe(published)) == 1
+    w = _withheld(published)
+    assert len(w) == 1 and json.loads(w[0][2])["reason"] == "unlabelled"
+    assert wiped._state["am_state"]["originator_nation"] == ""
+
+
+def test_declaration_after_a_refusal_labels_the_next_fault(published):
+    """Undeclared: the first close is withheld. Once the declaration reaches
+    the feed, the next event labels the record and the next close publishes."""
+    ctx = StubCtx(key=ASSET, now_ns=_now_ns())
+    _life(ctx, _feed_event())
+    assert _fe(published) == [] and len(_withheld(published)) == 1
+
+    ctx._now_ns += 60 * 1_000_000_000
+    _life(ctx, _feed_event("ATL"), event_id="e2")
+
+    got = _fe(published)
+    assert len(got) == 1 and len(_withheld(published)) == 1
+    assert json.loads(got[0][2])["originator_nation"] == "ATL"
+
+
+def test_cm_event_before_the_first_event_after_a_wipe_is_dropped(published, caplog):
+    """The window between a wipe and the asset's first telemetry event: a CM
+    event finds no record and is dropped with a warning, so no episode opens
+    and nothing is published or withheld. The cm-events topic keeps it for
+    replay."""
+    wiped = StubCtx(key=ASSET, now_ns=_now_ns())
+    with caplog.at_level("WARNING"):
+        _open(wiped)
+    assert wiped._state == {}
+    assert published == []
+    assert f"Dropping CM event for unknown asset {ASSET}" in caplog.text
